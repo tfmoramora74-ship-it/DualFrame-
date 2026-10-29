@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreImage
 import CoreMedia
 
 /// A sensor format the user can pick by hand.
