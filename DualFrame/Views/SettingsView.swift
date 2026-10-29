@@ -10,17 +10,19 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section {
-                    HStack(spacing: 10) {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3), spacing: 10) {
                         overlayTile("Grade", icon: "number", isOn: $model.config.showGrid)
                         overlayTile("Mira", icon: "plus", isOn: $model.config.showCrosshair)
                         overlayTile("Nível", icon: "level", isOn: $model.config.showLevel)
                         overlayTile("Histograma", icon: "chart.bar.fill", isOn: $model.config.showHistogram)
+                        overlayTile("Zebra", icon: "line.diagonal", isOn: $model.config.zebra)
+                        overlayTile("Peaking", icon: "scope", isOn: $model.config.focusPeaking)
                     }
                     .listRowInsets(EdgeInsets(top: 12, leading: 12, bottom: 12, trailing: 12))
                 } header: {
                     Text("Sobreposições")
                 } footer: {
-                    Text("As sobreposições nunca são gravadas nos seus takes.")
+                    Text("Nunca são gravadas nos seus takes. Zebra listra o que vai estourar; peaking colore o que está em foco.")
                 }
 
                 Section("Gravação") {
@@ -38,9 +40,11 @@ struct SettingsView: View {
                            isOn: $model.config.audioMeter)
                     toggle("Espelhar câmera frontal", "Salva o vídeo da câmera frontal espelhado, como na prévia.",
                            isOn: $model.config.mirrorFront)
-                    toggle("Seguir a rotação do celular",
-                           "Desligado: o celular é tratado sempre como em pé. Ligado: gravar deitado também sai na orientação certa.",
+                    toggle("Girar com o celular",
+                           "A tela gira e os arquivos seguem o jeito que você segura. Desligado: tudo fica sempre em pé.",
                            isOn: $model.config.followDeviceRotation)
+                    picker("Temporizador", "Atraso antes de fotografar ou começar a gravar. Toque no disparador para cancelar.",
+                           selection: $model.config.timerSeconds, options: [0, 3, 5, 10]) { $0 == 0 ? "Desligado" : "\($0) s" }
                     toggle("Manter os controles manuais", "Mantém ISO, obturador, balanço de branco e foco ao trocar de lente.",
                            isOn: $model.config.keepManualControls)
                 }

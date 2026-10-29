@@ -10,12 +10,15 @@ struct ZoomableMedia: UIViewRepresentable {
     }
 
     let content: Content
+    /// Single tap (after ruling out a double tap): show / hide the viewer chrome.
+    var onTap: (() -> Void)?
 
     func makeUIView(context: Context) -> ZoomScrollView {
         ZoomScrollView()
     }
 
     func updateUIView(_ view: ZoomScrollView, context: Context) {
+        view.onTap = onTap
         view.show(content)
     }
 }
@@ -24,6 +27,7 @@ final class ZoomScrollView: UIScrollView, UIScrollViewDelegate {
     private var contentView: UIView?
     private var shown: ZoomableMedia.Content?
     private var naturalSize = CGSize(width: 1, height: 1)
+    var onTap: (() -> Void)?
 
     init() {
         super.init(frame: .zero)
@@ -37,7 +41,12 @@ final class ZoomScrollView: UIScrollView, UIScrollViewDelegate {
         let doubleTap = UITapGestureRecognizer(target: self, action: #selector(doubleTapped(_:)))
         doubleTap.numberOfTapsRequired = 2
         addGestureRecognizer(doubleTap)
+        let singleTap = UITapGestureRecognizer(target: self, action: #selector(singleTapped))
+        singleTap.require(toFail: doubleTap)
+        addGestureRecognizer(singleTap)
     }
+
+    @objc private func singleTapped() { onTap?() }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 

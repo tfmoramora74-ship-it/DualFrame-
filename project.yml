@@ -6,8 +6,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.3"
-    CURRENT_PROJECT_VERSION: "4"
+    MARKETING_VERSION: "1.4"
+    CURRENT_PROJECT_VERSION: "5"
 targets:
   DualFrame:
     type: application
@@ -26,6 +26,8 @@ targets:
         UIStatusBarHidden: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         NSCameraUsageDescription: Grava vídeo vertical e horizontal ao mesmo tempo.

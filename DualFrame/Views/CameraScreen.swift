@@ -3,7 +3,6 @@ import SwiftUI
 
 struct CameraScreen: View {
     @StateObject private var model = CameraModel()
-    @StateObject private var motion = LevelMotion()
     @StateObject private var store = TakeStore()
     @Environment(\.scenePhase) private var scenePhase
     @State private var showFormatPanel = false
@@ -14,79 +13,60 @@ struct CameraScreen: View {
     @State private var flashOpacity = 0.0
 
     var body: some View {
-        ZStack {
-            Color(white: 0.11).ignoresSafeArea()
+        GeometryReader { geo in
+            let landscape = geo.size.width > geo.size.height
+            ZStack {
+                Color(white: 0.11).ignoresSafeArea()
 
-            if !model.denied, model.config.layout == .pip, !fullOnly {
-                FullScreenPrimary(model: model, motion: motion)
-                // Keeps the controls legible over a bright scene.
-                VStack(spacing: 0) {
-                    LinearGradient(colors: [.black.opacity(0.45), .clear], startPoint: .top, endPoint: .bottom)
-                        .frame(height: 120)
-                    Spacer()
-                    LinearGradient(colors: [.clear, .black.opacity(0.55)], startPoint: .top, endPoint: .bottom)
-                        .frame(height: 260)
+                if !model.denied, model.config.layout == .pip, !fullOnly {
+                    FullScreenPrimary(model: model, motion: model.motion)
+                    legibilityGradient(landscape: landscape)
                 }
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
-            }
 
-            if model.denied {
-                permissionView
-            } else {
-                VStack(spacing: 0) {
-                    topBar
-                    PreviewStage(model: model, motion: motion)
-                        .padding(.top, 8)
-                    LensRow(model: model, readouts: model.readouts)
-                        .padding(.top, 10)
-                    if model.config.mode == .longExposure {
-                        LongExposurePanel(model: model)
-                            .padding(.top, 10)
-                    }
-                    if showPro {
-                        ManualControlsView(model: model, readouts: model.readouts, selected: $proControl)
-                            .padding(.top, 10)
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
-                    }
-                    shutterRow
-                        .padding(.top, 14)
-                    modePicker
-                        .padding(.top, 14)
-                        .padding(.bottom, 6)
+                if model.denied {
+                    permissionView
+                } else if landscape {
+                    landscapeLayout
+                } else {
+                    portraitLayout
                 }
-            }
 
-            if showFormatPanel {
-                Color.black.opacity(0.001)
-                    .ignoresSafeArea()
-                    .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { showFormatPanel = false } }
-                VStack {
-                    FormatPanel(model: model)
+                if showFormatPanel {
+                    Color.black.opacity(0.001)
+                        .ignoresSafeArea()
+                        .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { showFormatPanel = false } }
+                    VStack {
+                        ScrollView {
+                            FormatPanel(model: model)
+                        }
+                        .scrollBounceBehavior(.basedOnSize)
+                        .frame(maxWidth: 520)
                         .padding(.horizontal, 12)
-                        .padding(.top, 58)
-                    Spacer()
+                        .padding(.top, landscape ? 8 : 58)
+                        Spacer(minLength: 0)
+                    }
+                    .transition(.move(edge: .top).combined(with: .opacity))
                 }
-                .transition(.move(edge: .top).combined(with: .opacity))
-            }
 
-            Color.white.opacity(flashOpacity).ignoresSafeArea().allowsHitTesting(false)
+                Color.white.opacity(flashOpacity).ignoresSafeArea().allowsHitTesting(false)
 
-            if let toast = model.toast {
-                VStack {
-                    Spacer()
-                    Text(toast)
-                        .font(.system(size: 14, weight: .medium))
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 16).padding(.vertical, 10)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                        .padding(.horizontal, 24)
-                        .padding(.bottom, 210)
-                }
-                .transition(.opacity)
-                .task(id: toast) {
-                    try? await Task.sleep(nanoseconds: 3_500_000_000)
-                    withAnimation { model.toast = nil }
+                if let toast = model.toast {
+                    VStack {
+                        Spacer()
+                        Text(toast)
+                            .font(.system(size: 14, weight: .medium))
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 16).padding(.vertical, 10)
+                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                            .padding(.horizontal, 24)
+                            .padding(.bottom, landscape ? 24 : 210)
+                    }
+                    .transition(.opacity)
+                    .task(id: toast) {
+                        try? await Task.sleep(nanoseconds: 3_500_000_000)
+                        withAnimation { model.toast = nil }
+                    }
+                    .allowsHitTesting(false)
                 }
             }
         }
@@ -95,15 +75,22 @@ struct CameraScreen: View {
         .animation(.easeOut(duration: 0.2), value: showPro)
         .animation(.easeOut(duration: 0.2), value: model.config.mode)
         .task {
+            OrientationLock.apply(rotates: model.config.followDeviceRotation)
             await model.start()
-            motion.start()
+        }
+        .onChange(of: model.config.followDeviceRotation) { _, rotates in
+            OrientationLock.apply(rotates: rotates)
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
-            case .active: model.resume(); motion.start()
-            case .background: model.suspend(); motion.stop()
+            case .active: model.resume()
+            case .background: model.suspend()
             default: break
             }
+        }
+        // Nothing renders behind a sheet: frees the GPU and main thread so Settings/Gallery stay smooth.
+        .onChange(of: showSettings || showGallery) { _, covered in
+            model.setPreviewsPaused(covered)
         }
         .onChange(of: model.flashTrigger) { _, _ in
             flashOpacity = 0.85
@@ -118,58 +105,234 @@ struct CameraScreen: View {
         .background(ShutterButtonInteraction { model.shutterPressed() })
     }
 
-    // MARK: Top bar
+    // MARK: Layouts
 
-    private var topBar: some View {
-        HStack {
-            Button {
-                withAnimation(.easeOut(duration: 0.2)) { showFormatPanel.toggle() }
-            } label: {
-                HStack(spacing: 12) {
-                    switch model.config.mode {
-                    case .video:
-                        chipValue(primaryResolutionLabel, sub: "RES")
-                        chipValue("\(Int(model.state.fps))", sub: rangeBadge)
-                    case .photo:
-                        chipValue(photoChip, sub: model.config.photoProcessing == .apple && model.config.rawPhoto ? "RAW" : "FOTO")
-                    case .longExposure:
-                        chipValue("\(model.config.longExposureSeconds)s", sub: "EXP")
-                    }
-                    Image(systemName: "slider.horizontal.3")
-                        .font(.system(size: 17, weight: .medium))
-                        .foregroundStyle(Color.accentTeal)
-                }
-                .padding(.horizontal, 16)
-                .frame(height: 44)
-                .background(.black.opacity(0.55), in: Capsule())
+    private var portraitLayout: some View {
+        VStack(spacing: 0) {
+            HStack {
+                formatChip
+                Spacer()
+                toolsCapsule(axis: .horizontal)
             }
-            .disabled(model.isRecording)
-            .accessibilityLabel("Resolução e quadros por segundo")
+            .padding(.horizontal, 14)
+            .padding(.top, 4)
 
-            Spacer()
+            PreviewStage(model: model, motion: model.motion)
+                .padding(.top, 8)
 
-            HStack(spacing: 18) {
-                if model.hasTorch {
-                    toolbarIcon(model.torchOn ? "bolt.fill" : "bolt.slash", active: model.torchOn,
-                                label: "Lanterna") { model.toggleTorch() }
-                }
-                toolbarIcon("camera.aperture", active: showPro, label: "Controles manuais") {
-                    showPro.toggle()
-                    if !showPro { proControl = nil }
-                }
-                toolbarIcon("arrow.triangle.2.circlepath.camera", active: false, label: "Virar câmera") {
-                    model.flipCamera()
-                }
-                .disabled(model.isRecording || model.isSwitching)
-                toolbarIcon("gearshape.fill", active: false, label: "Ajustes") { showSettings = true }
-                    .disabled(model.isRecording)
+            statusLine.padding(.top, 6)
+            LensRow(model: model, readouts: model.readouts, axis: .horizontal)
+                .padding(.top, 6)
+            panels.padding(.top, 10)
+
+            HStack {
+                galleryButton
+                Spacer()
+                shutter
+                Spacer()
+                layoutButton
             }
-            .padding(.horizontal, 18)
+            .padding(.horizontal, 26)
+            .padding(.top, 14)
+
+            modePicker(axis: .horizontal)
+                .padding(.top, 14)
+                .padding(.bottom, 6)
+        }
+    }
+
+    /// Phone on its side: preview on the left, controls in a column on the right (like the Camera app).
+    private var landscapeLayout: some View {
+        HStack(spacing: 0) {
+            VStack(spacing: 12) {
+                formatChip
+                toolsCapsule(axis: .vertical)
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 8)
+            .padding(.vertical, 8)
+
+            ZStack(alignment: .bottom) {
+                PreviewStage(model: model, motion: model.motion)
+                VStack(spacing: 8) {
+                    statusLine
+                    panels.frame(maxWidth: 460)
+                }
+                .padding(.bottom, 8)
+            }
+            .padding(.horizontal, 8)
+
+            HStack(spacing: 10) {
+                LensRow(model: model, readouts: model.readouts, axis: .vertical)
+                VStack(spacing: 16) {
+                    galleryButton
+                    Spacer(minLength: 0)
+                    shutter
+                    Spacer(minLength: 0)
+                    layoutButton
+                }
+                .padding(.vertical, 8)
+                modePicker(axis: .vertical)
+            }
+            .padding(.trailing, 8)
+        }
+    }
+
+    @ViewBuilder private var panels: some View {
+        if model.config.mode == .longExposure {
+            LongExposurePanel(model: model)
+        }
+        if showPro {
+            ManualControlsView(model: model, readouts: model.readouts, selected: $proControl)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
+    private func legibilityGradient(landscape: Bool) -> some View {
+        Group {
+            if landscape {
+                HStack(spacing: 0) {
+                    LinearGradient(colors: [.black.opacity(0.45), .clear], startPoint: .leading, endPoint: .trailing)
+                        .frame(width: 140)
+                    Spacer()
+                    LinearGradient(colors: [.clear, .black.opacity(0.55)], startPoint: .leading, endPoint: .trailing)
+                        .frame(width: 260)
+                }
+            } else {
+                VStack(spacing: 0) {
+                    LinearGradient(colors: [.black.opacity(0.45), .clear], startPoint: .top, endPoint: .bottom)
+                        .frame(height: 120)
+                    Spacer()
+                    LinearGradient(colors: [.clear, .black.opacity(0.55)], startPoint: .top, endPoint: .bottom)
+                        .frame(height: 260)
+                }
+            }
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+    }
+
+    // MARK: Pieces
+
+    private var formatChip: some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.2)) { showFormatPanel.toggle() }
+        } label: {
+            HStack(spacing: 12) {
+                switch model.config.mode {
+                case .video:
+                    chipValue(primaryResolutionLabel, sub: "RES")
+                    chipValue("\(Int(model.state.fps))", sub: rangeBadge)
+                case .photo:
+                    chipValue(photoChip, sub: model.config.photoProcessing == .apple && model.config.rawPhoto ? "RAW" : "FOTO")
+                case .longExposure:
+                    chipValue("\(model.config.longExposureSeconds)s", sub: "EXP")
+                }
+                Image(systemName: "slider.horizontal.3")
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundStyle(Color.accentTeal)
+            }
+            .padding(.horizontal, 16)
             .frame(height: 44)
             .background(.black.opacity(0.55), in: Capsule())
         }
-        .padding(.horizontal, 14)
-        .padding(.top, 4)
+        .disabled(model.isRecording)
+        .accessibilityLabel("Resolução e quadros por segundo")
+    }
+
+    private func toolsCapsule(axis: Axis) -> some View {
+        let layout = axis == .horizontal ? AnyLayout(HStackLayout(spacing: 16)) : AnyLayout(VStackLayout(spacing: 4))
+        return layout {
+            if model.hasTorch {
+                toolbarIcon(model.torchOn ? "bolt.fill" : "bolt.slash", active: model.torchOn,
+                            label: "Lanterna") { model.toggleTorch() }
+            }
+            toolbarIcon(timerIcon, active: model.config.timerSeconds > 0, label: "Temporizador") {
+                model.config.timerSeconds = model.config.timerSeconds == 0 ? 3 : (model.config.timerSeconds == 3 ? 10 : 0)
+            }
+            .disabled(model.isRecording)
+            toolbarIcon("camera.aperture", active: showPro, label: "Controles manuais") {
+                showPro.toggle()
+                if !showPro { proControl = nil }
+            }
+            toolbarIcon("arrow.triangle.2.circlepath.camera", active: false, label: "Virar câmera") {
+                model.flipCamera()
+            }
+            .disabled(model.isRecording || model.isSwitching)
+            toolbarIcon("gearshape.fill", active: false, label: "Ajustes") { showSettings = true }
+                .disabled(model.isRecording)
+        }
+        .padding(axis == .horizontal ? .horizontal : .vertical, axis == .horizontal ? 16 : 10)
+        .frame(width: axis == .vertical ? 44 : nil, height: axis == .horizontal ? 44 : nil)
+        .background(.black.opacity(0.55), in: Capsule())
+    }
+
+    private var timerIcon: String {
+        switch model.config.timerSeconds {
+        case 3: return "3.circle"
+        case 5: return "5.circle"
+        case 10: return "10.circle"
+        default: return "timer"
+        }
+    }
+
+    /// Remaining recording time / photos, AE/AF lock and heat, like the original's "12h 14 min" line.
+    private var statusLine: some View {
+        HStack(spacing: 10) {
+            if !model.remainingLabel.isEmpty {
+                Label(model.remainingLabel, systemImage: "internaldrive")
+            }
+            if model.thermalWarning != nil {
+                Label("Quente", systemImage: "thermometer.high").foregroundStyle(.orange)
+            }
+        }
+        .font(.system(size: 12, weight: .medium).monospacedDigit())
+        .foregroundStyle(.white.opacity(0.7))
+        .labelStyle(.titleAndIcon)
+    }
+
+    private var galleryButton: some View {
+        Button {
+            showGallery = true
+        } label: {
+            Group {
+                if let thumb = model.lastThumbnail {
+                    Image(uiImage: thumb).resizable().scaledToFill()
+                } else {
+                    Image(systemName: "photo.on.rectangle").font(.system(size: 20)).foregroundStyle(.white)
+                }
+            }
+            .frame(width: 52, height: 52)
+            .background(Color.black.opacity(0.4))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.white.opacity(0.25)))
+        }
+        .disabled(model.isRecording || model.stackProgress != nil)
+        .accessibilityLabel("Galeria")
+    }
+
+    private var shutter: some View {
+        ShutterButton(mode: model.config.mode, isRecording: model.isRecording,
+                      isBusy: model.isBusy, stackProgress: model.stackProgress,
+                      countingDown: model.countdown != nil) {
+            model.shutterPressed()
+        }
+        .disabled(model.isSwitching)
+    }
+
+    private var layoutButton: some View {
+        Button {
+            withAnimation(.spring(duration: 0.35)) {
+                model.config.layout = model.config.layout == .split ? .pip : .split
+            }
+        } label: {
+            Image(systemName: model.config.layout == .split ? "pip" : "rectangle.split.1x2")
+                .font(.system(size: 21, weight: .medium))
+                .foregroundStyle(Color.accentTeal)
+                .frame(width: 52, height: 52)
+                .background(Color.black.opacity(0.4), in: Circle())
+        }
+        .accessibilityLabel(model.config.layout == .split ? "Uma prévia grande com janela" : "Prévias separadas")
     }
 
     private var photoChip: String {
@@ -212,63 +375,14 @@ struct CameraScreen: View {
             Image(systemName: name)
                 .font(.system(size: 18, weight: .medium))
                 .foregroundStyle(active ? Color.accentTeal : Color.white)
-                .frame(width: 26, height: 44)
+                .frame(width: 28, height: 40)
         }
         .accessibilityLabel(label)
     }
 
-    // MARK: Shutter row
-
-    private var shutterRow: some View {
-        HStack {
-            Button {
-                showGallery = true
-            } label: {
-                Group {
-                    if let thumb = model.lastThumbnail {
-                        Image(uiImage: thumb).resizable().scaledToFill()
-                    } else {
-                        Image(systemName: "photo.on.rectangle").font(.system(size: 20)).foregroundStyle(.white)
-                    }
-                }
-                .frame(width: 52, height: 52)
-                .background(Color.black.opacity(0.4))
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.white.opacity(0.25)))
-            }
-            .disabled(model.isRecording || model.stackProgress != nil)
-            .accessibilityLabel("Gravações")
-
-            Spacer()
-
-            ShutterButton(mode: model.config.mode, isRecording: model.isRecording,
-                          isBusy: model.isBusy, stackProgress: model.stackProgress) {
-                model.shutterPressed()
-            }
-            .disabled(model.isSwitching)
-
-            Spacer()
-
-            Button {
-                withAnimation(.spring(duration: 0.35)) {
-                    model.config.layout = model.config.layout == .split ? .pip : .split
-                }
-            } label: {
-                Image(systemName: model.config.layout == .split ? "pip" : "rectangle.split.1x2")
-                    .font(.system(size: 21, weight: .medium))
-                    .foregroundStyle(Color.accentTeal)
-                    .frame(width: 52, height: 52)
-                    .background(Color.black.opacity(0.4), in: Circle())
-            }
-            .accessibilityLabel(model.config.layout == .split ? "Uma prévia grande com janela" : "Prévias separadas")
-        }
-        .padding(.horizontal, 26)
-    }
-
-    // MARK: Mode picker
-
-    private var modePicker: some View {
-        HStack(spacing: 2) {
+    private func modePicker(axis: Axis) -> some View {
+        let layout = axis == .horizontal ? AnyLayout(HStackLayout(spacing: 2)) : AnyLayout(VStackLayout(spacing: 2))
+        return layout {
             ForEach(CaptureMode.allCases) { mode in
                 let selected = model.config.mode == mode
                 Button {
@@ -276,9 +390,9 @@ struct CameraScreen: View {
                     model.config.mode = mode
                 } label: {
                     Text(mode.label)
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(.system(size: axis == .horizontal ? 15 : 12, weight: .semibold))
                         .foregroundStyle(selected ? Color.white : Color.white.opacity(0.75))
-                        .frame(width: 98, height: 38)
+                        .frame(width: axis == .horizontal ? 98 : 74, height: axis == .horizontal ? 38 : 44)
                         .background(selected ? Color.accentTeal : Color.clear, in: Capsule())
                 }
             }
@@ -307,9 +421,11 @@ struct CameraScreen: View {
 private struct LensRow: View {
     @ObservedObject var model: CameraModel
     @ObservedObject var readouts: DeviceReadouts
+    var axis: Axis = .horizontal
 
     var body: some View {
-        HStack(spacing: 6) {
+        let layout = axis == .horizontal ? AnyLayout(HStackLayout(spacing: 6)) : AnyLayout(VStackLayout(spacing: 6))
+        layout {
             ForEach(model.lensButtons) { button in
                 let active = model.isActive(button, zoom: readouts.zoomDisplay)
                 Button {
@@ -388,6 +504,7 @@ struct ShutterButton: View {
     let isRecording: Bool
     let isBusy: Bool
     let stackProgress: Double?
+    var countingDown = false
     let action: () -> Void
 
     var body: some View {
@@ -418,6 +535,13 @@ struct ShutterButton: View {
                             .font(.system(size: 24))
                             .foregroundStyle(.black)
                     }
+                }
+            }
+            .overlay {
+                if countingDown {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(.black)
                 }
             }
             .animation(.spring(duration: 0.25), value: isRecording)

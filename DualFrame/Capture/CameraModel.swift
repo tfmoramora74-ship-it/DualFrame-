@@ -80,8 +80,19 @@ final class CameraModel: ObservableObject {
     @Published private(set) var manualFocus = false
     @Published private(set) var torchOn = false
     @Published private(set) var lensButtons: [LensButton] = []
+    /// Focus and exposure held at a point (long press); cleared by a normal tap.
+    @Published private(set) var aeafLocked = false
+    /// Seconds left on the self-timer, nil when idle.
+    @Published private(set) var countdown: Int?
+    /// "2 h 10 min" of recording left on this setup, or photos left.
+    @Published private(set) var remainingLabel = ""
+    @Published private(set) var thermalWarning: String?
+    @Published private(set) var previewsPaused = false
 
     let meters = LiveMeters()
+    let motion = LevelMotion()
+    private var countdownTask: Task<Void, Never>?
+    private var thermalObserver: NSObjectProtocol?
     let readouts = DeviceReadouts()
     let engine = CaptureEngine()
     private let rearLenses = CaptureEngine.rearLenses()
@@ -122,6 +133,47 @@ final class CameraModel: ObservableObject {
             Task { @MainActor in self?.toast = message }
         }
         loadLastThumbnail()
+        thermalObserver = NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.updateThermal() }
+        }
+        updateThermal()
+    }
+
+    private func updateThermal() {
+        switch ProcessInfo.processInfo.thermalState {
+        case .serious: thermalWarning = "iPhone quente: pode reduzir a qualidade ou parar gravações longas."
+        case .critical: thermalWarning = "iPhone muito quente: pare de gravar e deixe esfriar."
+        default: thermalWarning = nil
+        }
+        if let thermalWarning { toast = thermalWarning }
+    }
+
+    /// Recording time (video) or photo count left on the device for the current setup.
+    func updateRemaining() {
+        let values = try? URL(fileURLWithPath: NSHomeDirectory())
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        guard let free = values?.volumeAvailableCapacityForImportantUsage, free > 0 else { remainingLabel = ""; return }
+        if config.mode == .video {
+            var bitsPerSecond = 256_000.0 * Double(config.outputs.count)
+            for kind in config.outputs {
+                guard let size = outputSize(for: kind) else { continue }
+                let pixelsPerSecond = Double(size.width * size.height) * state.fps
+                switch config.codec {
+                case .hevc: bitsPerSecond += pixelsPerSecond * config.quality.bitsPerPixel
+                case .h264: bitsPerSecond += pixelsPerSecond * config.quality.bitsPerPixel * 1.6
+                case .prores: bitsPerSecond += pixelsPerSecond * 1.9
+                }
+            }
+            let seconds = Double(free) * 8 / max(bitsPerSecond, 1)
+            let hours = Int(seconds / 3600), minutes = Int(seconds.truncatingRemainder(dividingBy: 3600) / 60)
+            remainingLabel = hours > 0 ? "\(hours) h \(minutes) min" : "\(minutes) min"
+        } else {
+            let perShot = config.photoProcessing == .superResolution ? 9_000_000.0 : 4_000_000.0
+            let raw = config.rawPhoto && config.photoProcessing == .apple ? 25_000_000.0 : 0
+            let shots = Int(Double(free) / (perShot * Double(max(1, config.outputs.count)) + raw))
+            remainingLabel = "\(shots) fotos"
+        }
     }
 
     // MARK: Lifecycle
@@ -134,16 +186,27 @@ final class CameraModel: ObservableObject {
         guard video else { return }
         reconfigure(startAfter: true)
         startPolling()
+        motion.start()
     }
 
     func resume() {
         guard authorized else { return }
         engine.sessionQueue.async { [engine] in engine.start() }
+        if !previewsPaused { motion.start() }
     }
 
     func suspend() {
         if isRecording { stopRecording() }
+        cancelCountdown()
         engine.sessionQueue.async { [engine] in engine.stop() }
+        motion.stop()
+    }
+
+    /// A sheet covers the camera: stop drawing previews and the level so the sheet stays smooth.
+    func setPreviewsPaused(_ paused: Bool) {
+        previewsPaused = paused
+        if paused { motion.stop() } else { motion.start() }
+        updatePreviewSpec()
     }
 
     func reconfigure(startAfter: Bool = false) {
@@ -185,7 +248,9 @@ final class CameraModel: ObservableObject {
             pendingFactor = nil
             setZoomFactor(factor, animated: false)
         }
+        aeafLocked = false
         updatePreviewSpec()
+        updateRemaining()
     }
 
     var isFront: Bool { state.device?.position == .front }
@@ -209,12 +274,15 @@ final class CameraModel: ObservableObject {
     /// Degrees that turn the delivered buffer upright for files and previews.
     var captureRotation: Double {
         if let lockedRotation { return lockedRotation }
-        if isFront { return 0 } // the front buffer is already turned upright by the connection
-        return config.followDeviceRotation ? deviceRotation : 90
+        let held = config.followDeviceRotation ? deviceRotation : 90
+        // The front buffer already arrives turned upright for portrait (90°) by the connection.
+        return isFront ? held - 90 : held
     }
 
     private func updatePreviewSpec() {
-        engine.setPreviewSpec(PreviewSpec(rotationDegrees: captureRotation, mirror: isFront))
+        engine.setPreviewSpec(PreviewSpec(rotationDegrees: captureRotation, mirror: isFront,
+                                          zebra: config.zebra, peaking: config.focusPeaking,
+                                          paused: previewsPaused))
     }
 
     /// Upright size of each output for the tile captions.
@@ -233,6 +301,41 @@ final class CameraModel: ObservableObject {
 
     func shutterPressed() {
         guard !isSwitching else { return }
+        if countdown != nil {
+            cancelCountdown()
+            return
+        }
+        // The self-timer delays starts only, never stops.
+        let starting = !isRecording && stackProgress == nil
+        if starting, config.timerSeconds > 0 {
+            startCountdown()
+            return
+        }
+        fireShutter()
+    }
+
+    private func startCountdown() {
+        countdown = config.timerSeconds
+        countdownTask = Task { [weak self] in
+            while let left = self?.countdown, left > 0 {
+                UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled, self?.countdown != nil else { return }
+                self?.countdown = left - 1
+            }
+            guard let self, self.countdown == 0 else { return }
+            self.countdown = nil
+            self.fireShutter()
+        }
+    }
+
+    func cancelCountdown() {
+        countdownTask?.cancel()
+        countdownTask = nil
+        countdown = nil
+    }
+
+    private func fireShutter() {
         switch config.mode {
         case .photo: takePhoto()
         case .video: toggleRecording()
@@ -389,6 +492,7 @@ final class CameraModel: ObservableObject {
         }
         NotificationCenter.default.post(name: TakeStore.didChange, object: nil)
         loadLastThumbnail()
+        updateRemaining()
         if config.saveToPhotos, !result.urls.isEmpty {
             PhotoSaver.save(result.urls) { [weak self] message in
                 Task { @MainActor in self?.toast = message }
@@ -499,7 +603,8 @@ final class CameraModel: ObservableObject {
     // MARK: Focus / exposure / white balance
 
     /// `point` is normalized (0...1, top-left) inside the upright preview tile of `kind`.
-    func focus(at point: CGPoint, in kind: OutputKind) {
+    /// `lock`: long press holds focus and exposure (AE/AF lock); a plain tap tracks continuously.
+    func focus(at point: CGPoint, in kind: OutputKind, lock: Bool = false) {
         guard bufferSize.width > 0 else { return }
         let w = Int(bufferSize.width), h = Int(bufferSize.height)
         let rotation = CropMath.normalizedRotation(captureRotation)
@@ -519,14 +624,18 @@ final class CameraModel: ObservableObject {
             devicePoint = CGPoint(x: devicePoint.y, y: 1 - devicePoint.x)
         }
         let lockFocus = manualFocus, lockExposure = manualExposure
+        let hold = lock
+        aeafLocked = lock
+        if lock { UIImpactFeedbackGenerator(style: .medium).impactOccurred() }
         withDevice { device in
             if !lockFocus, device.isFocusPointOfInterestSupported {
                 device.focusPointOfInterest = devicePoint
-                device.focusMode = .continuousAutoFocus
+                // .autoFocus focuses once and then holds; continuous keeps tracking.
+                device.focusMode = hold && device.isFocusModeSupported(.autoFocus) ? .autoFocus : .continuousAutoFocus
             }
             if !lockExposure, device.isExposurePointOfInterestSupported {
                 device.exposurePointOfInterest = devicePoint
-                device.exposureMode = .continuousAutoExposure
+                device.exposureMode = hold && device.isExposureModeSupported(.autoExpose) ? .autoExpose : .continuousAutoExposure
             }
         }
     }
@@ -685,6 +794,7 @@ final class CameraModel: ObservableObject {
             if r.temperature != kelvin { r.temperature = kelvin }
         }
         pollTick += 1
+        if pollTick % 120 == 0 { updateRemaining() }
         if pollTick % 4 == 0 {
             engine.sessionQueue.async { [engine] in
                 let label = engine.activeStabilization

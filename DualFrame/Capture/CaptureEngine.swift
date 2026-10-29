@@ -39,6 +39,10 @@ struct SessionState {
 struct PreviewSpec {
     var rotationDegrees: Double = 90
     var mirror = false
+    var zebra = false
+    var peaking = false
+    /// A sheet covers the camera: skip preview rendering entirely.
+    var paused = false
 }
 
 private final class WeakLayer {
@@ -137,7 +141,7 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
         let sinks = previewSinks.mapValues { $0.compactMap(\.layer) }.filter { !$0.value.isEmpty }
         let spec = previewSpec
         lock.unlock()
-        guard !sinks.isEmpty else { return }
+        guard !sinks.isEmpty, !spec.paused else { return }
 
         let width = CVPixelBufferGetWidth(pixelBuffer), height = CVPixelBufferGetHeight(pixelBuffer)
         let rotation = CropMath.normalizedRotation(spec.rotationDegrees)
@@ -148,7 +152,9 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
             let upright = CropMath.uprightSize(crop.size, rotationDegrees: Double(rotation))
             let scale = min(1, 960 / max(upright.width, upright.height))
             let size = CGSize(width: CropMath.even(upright.width * scale), height: CropMath.even(upright.height * scale))
-            let image = renderer.image(from: source, crop: crop, rotation: rotation, mirror: spec.mirror, size: size)
+            var image = renderer.image(from: source, crop: crop, rotation: rotation, mirror: spec.mirror, size: size)
+            if spec.peaking { image = Self.peaking(image) }
+            if spec.zebra { image = Self.zebra(image) }
             guard let frame = renderer.render(image, size: size, format: kCVPixelFormatType_32BGRA,
                                               colorSpace: FrameRenderer.displaySpace, tagsFrom: nil),
                   let sample = Self.displaySample(frame, time: time) else { continue }
@@ -158,6 +164,41 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
                 sink.enqueue(sample)
             }
         }
+    }
+
+    /// Diagonal stripes where the picture is about to clip (≈ 95 % luma).
+    private static func zebra(_ image: CIImage) -> CIImage {
+        let extent = image.extent
+        let mask = image
+            .applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0])
+            .applyingFilter("CIColorThreshold", parameters: ["inputThreshold": 0.9])
+        let stripes = CIFilter(name: "CIStripesGenerator", parameters: [
+            "inputColor0": CIColor(red: 1, green: 1, blue: 1, alpha: 0.85),
+            "inputColor1": CIColor(red: 0, green: 0, blue: 0, alpha: 0.35),
+            "inputWidth": 5,
+            "inputSharpness": 1,
+        ])?.outputImage?
+            .transformed(by: CGAffineTransform(rotationAngle: .pi / 4))
+            .cropped(to: extent) ?? image
+        return stripes.applyingFilter("CIBlendWithMask", parameters: [
+            kCIInputBackgroundImageKey: image,
+            kCIInputMaskImageKey: mask,
+        ]).cropped(to: extent)
+    }
+
+    /// Paints sharp (in-focus) edges in the accent colour.
+    private static func peaking(_ image: CIImage) -> CIImage {
+        let extent = image.extent
+        let mask = image
+            .applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0])
+            .applyingFilter("CIEdges", parameters: [kCIInputIntensityKey: 5])
+            .applyingFilter("CIColorThreshold", parameters: ["inputThreshold": 0.22])
+            .cropped(to: extent)
+        let color = CIImage(color: CIColor(red: 0.27, green: 0.9, blue: 1)).cropped(to: extent)
+        return color.applyingFilter("CIBlendWithMask", parameters: [
+            kCIInputBackgroundImageKey: image,
+            kCIInputMaskImageKey: mask,
+        ]).cropped(to: extent)
     }
 
     private static func displaySample(_ buffer: CVPixelBuffer, time: CMTime) -> CMSampleBuffer? {
@@ -677,14 +718,6 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
             pool = formats
         }
         if video {
-            let bigEnough = pool.filter { Int(dimensions($0).width) >= config.requiredFormatWidth }
-            if !bigEnough.isEmpty {
-                pool = bigEnough
-            } else {
-                let best = pool.map(area).max() ?? 0
-                pool = pool.filter { area($0) == best }
-                notes.append("A \(config.fps) fps o sensor entrega no máximo \(dimensions(pool[0]).width)×\(dimensions(pool[0]).height) em 4:3.")
-            }
             let space: AVCaptureColorSpace? = config.dynamicRange == .log ? .appleLog
                 : (config.dynamicRange == .hdr ? .HLG_BT2020 : nil)
             if let space {
@@ -697,19 +730,43 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
                 let sdr = pool.filter { subtype($0) != "x420" }
                 if !sdr.isEmpty { pool = sdr }
             }
-            for mode in stabilizationModes(for: config.stabilization) where mode != .off {
-                let stable = pool.filter { $0.isVideoStabilizationModeSupported(mode) }
-                if !stable.isEmpty {
-                    pool = stable
-                    break
+
+            func stabilized(_ formats: [AVCaptureDevice.Format]) -> [AVCaptureDevice.Format] {
+                for mode in stabilizationModes(for: config.stabilization) where mode != .off {
+                    let matching = formats.filter { $0.isVideoStabilizationModeSupported(mode) }
+                    if !matching.isEmpty { return matching }
                 }
+                return []
+            }
+            let big = pool.filter { Int(dimensions($0).width) >= config.requiredFormatWidth }
+            let wantsBig = config.outputs.contains { config.resolution(for: $0) != .hd }
+            if config.stabilization != .off {
+                let bigStable = stabilized(big)
+                let anyStable = stabilized(pool)
+                if !bigStable.isEmpty {
+                    pool = bigStable
+                } else if !wantsBig, !anyStable.isEmpty {
+                    // Everything is HD: a stabilized smaller sensor mode beats an unstabilized full one.
+                    pool = anyStable
+                    if !big.isEmpty {
+                        let d = dimensions(anyStable.max(by: { area($0) < area($1) })!)
+                        notes.append("Estabilização usa o sensor \(d.width)×\(d.height): o modo de sensor completo deste iPhone não estabiliza.")
+                    }
+                } else if !big.isEmpty {
+                    pool = big
+                    notes.append("Neste iPhone o sensor completo (4K) não tem estabilização. Use HD para filmar na mão.")
+                }
+            } else if !big.isEmpty {
+                pool = big
+            }
+            if pool.allSatisfy({ Int(dimensions($0).width) < config.requiredFormatWidth }), wantsBig {
+                let best = pool.max(by: { area($0) < area($1) }).map(dimensions)
+                if let best { notes.append("A \(config.fps) fps o sensor entrega no máximo \(best.width)×\(best.height) em 4:3.") }
             }
         }
+        // Largest qualifying format: full sensor detail for the crops.
         return pool.sorted { a, b in
-            if area(a) != area(b) {
-                // Stills: biggest. Video: smallest that qualifies (cooler, fewer pixels to move).
-                return video ? area(a) < area(b) : area(a) > area(b)
-            }
+            if area(a) != area(b) { return area(a) > area(b) }
             if a.isVideoBinned != b.isVideoBinned { return !a.isVideoBinned }
             return subtype(a) == "420f"
         }.first

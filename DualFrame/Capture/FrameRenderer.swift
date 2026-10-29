@@ -163,7 +163,8 @@ final class FrameStacker {
 
     /// The final image (averaged when blending by mean).
     func result() -> CIImage {
-        let image = accumulated
+        // Alpha was summed along with colour; force it back to 1 or the photo comes out N× too dark.
+        let image = accumulated.settingAlphaOne(in: CGRect(x: 0, y: 0, width: width, height: height))
         guard blend == .average, count > 1 else { return image }
         let k = CGFloat(1) / CGFloat(count)
         return image.applyingFilter("CIColorMatrix", parameters: [

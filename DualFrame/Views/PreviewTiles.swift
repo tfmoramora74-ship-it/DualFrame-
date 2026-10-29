@@ -43,17 +43,18 @@ struct SampleBufferView: UIViewRepresentable {
     }
 }
 
-/// One live format: preview, overlays, caption, focus tap.
+/// One live format: preview, overlays, caption, tap to focus, long press to lock AE/AF.
 struct FormatTile: View {
     let kind: OutputKind
     @ObservedObject var model: CameraModel
-    @ObservedObject var motion: LevelMotion
+    let motion: LevelMotion
     var isPrimary = true
     var compact = false
-    /// Fills the whole screen edge to edge (aspect fill) instead of showing the exact frame.
+    /// Fills its whole frame (aspect fill) instead of showing the exact format.
     var fullBleed = false
 
     @State private var focusPoint: CGPoint?
+    @State private var pressStart: Date?
 
     private var cornerRadius: CGFloat { fullBleed ? 0 : (compact ? 10 : 16) }
 
@@ -77,45 +78,56 @@ struct FormatTile: View {
                 }
 
                 if let focusPoint {
-                    FocusSquare()
+                    FocusSquare(locked: model.aeafLocked)
                         .position(x: focusPoint.x * geo.size.width, y: focusPoint.y * geo.size.height)
                 }
 
                 if !fullBleed {
-                VStack {
-                    Spacer()
-                    Text(caption(enabled: enabled))
-                        .font(.system(size: compact ? 10 : 12, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.85))
-                        .padding(.horizontal, 8).padding(.vertical, 3)
-                        .background(.black.opacity(0.35), in: Capsule())
-                        .padding(.bottom, compact ? 4 : 8)
-                }
+                    VStack {
+                        Spacer()
+                        Text(caption(enabled: enabled))
+                            .font(.system(size: compact ? 10 : 12, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.85))
+                            .padding(.horizontal, 8).padding(.vertical, 3)
+                            .background(.black.opacity(0.35), in: Capsule())
+                            .padding(.bottom, compact ? 4 : 8)
+                    }
                 }
             }
             .contentShape(Rectangle())
-            // Compact windows leave taps to their parent (swap); full tiles tap to focus.
-            .gesture(SpatialTapGesture().onEnded { value in
-                guard enabled else { return }
-                let point = CGPoint(x: value.location.x / geo.size.width, y: value.location.y / geo.size.height)
-                model.focus(at: contentPoint(value.location, in: geo.size), in: kind)
-                withAnimation(.easeOut(duration: 0.15)) { focusPoint = point }
-                Task {
-                    try? await Task.sleep(nanoseconds: 1_200_000_000)
-                    withAnimation { if focusPoint == point { focusPoint = nil } }
-                }
-            }, including: compact ? .none : .all)
+            // One gesture for both: a short tap focuses, a press of half a second locks AE/AF.
+            // Compact windows leave touches to their parent (swap / resize).
+            .gesture(DragGesture(minimumDistance: 0)
+                .onChanged { _ in if pressStart == nil { pressStart = Date() } }
+                .onEnded { value in
+                    let held = Date().timeIntervalSince(pressStart ?? Date())
+                    pressStart = nil
+                    guard enabled, hypot(value.translation.width, value.translation.height) < 12 else { return }
+                    let lock = held >= 0.5
+                    let point = CGPoint(x: value.location.x / geo.size.width, y: value.location.y / geo.size.height)
+                    model.focus(at: contentPoint(value.location, in: geo.size), in: kind, lock: lock)
+                    withAnimation(.easeOut(duration: 0.15)) { focusPoint = point }
+                    if !lock {
+                        Task {
+                            try? await Task.sleep(nanoseconds: 1_200_000_000)
+                            withAnimation { if focusPoint == point, !model.aeafLocked { focusPoint = nil } }
+                        }
+                    }
+                }, including: compact ? .none : .all)
         }
-        .aspectRatio(fullBleed ? nil : CGFloat(kind.uprightAspect), contentMode: .fit)
+        .keepingAspect(fullBleed ? nil : CGFloat(kind.uprightAspect))
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .strokeBorder(model.isRecording && enabled ? Color.red.opacity(0.9) : Color.white.opacity(fullBleed ? 0 : 0.18),
                               lineWidth: model.isRecording && enabled ? 2 : 1)
         )
+        .onChange(of: model.aeafLocked) { _, locked in
+            if !locked { withAnimation { focusPoint = nil } }
+        }
     }
 
-    /// Maps a tap in the view to 0...1 of the format's frame, undoing aspect-fill cropping.
+    /// Maps a touch in the view to 0...1 of the format's frame, undoing aspect-fill cropping.
     private func contentPoint(_ location: CGPoint, in size: CGSize) -> CGPoint {
         let aspect = CGFloat(kind.uprightAspect)
         let contentWidth = max(size.width, size.height * aspect)
@@ -133,22 +145,33 @@ struct FormatTile: View {
 }
 
 struct FocusSquare: View {
+    var locked = false
     @State private var scale: CGFloat = 1.4
 
     var body: some View {
         RoundedRectangle(cornerRadius: 4)
-            .strokeBorder(Color.yellow, lineWidth: 1.5)
+            .strokeBorder(Color.yellow, lineWidth: locked ? 2 : 1.5)
             .frame(width: 64, height: 64)
+            .overlay(alignment: .top) {
+                if locked {
+                    Text("AE/AF")
+                        .font(.system(size: 9, weight: .heavy))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 4).padding(.vertical, 1)
+                        .background(Color.yellow, in: RoundedRectangle(cornerRadius: 3))
+                        .offset(y: -14)
+                }
+            }
             .scaleEffect(scale)
             .onAppear { withAnimation(.spring(duration: 0.3)) { scale = 1 } }
             .allowsHitTesting(false)
     }
 }
 
-/// The live preview area: both formats stacked, or one big with the other in a corner window.
+/// The live preview area: both formats side by side / stacked, or the corner window of the other format.
 struct PreviewStage: View {
     @ObservedObject var model: CameraModel
-    @ObservedObject var motion: LevelMotion
+    let motion: LevelMotion
     @State private var pinchStart: CGFloat?
 
     var onlyFull: Bool {
@@ -170,7 +193,7 @@ struct PreviewStage: View {
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
-        .gesture(
+        .simultaneousGesture(
             MagnificationGesture()
                 .onChanged { scale in
                     if pinchStart == nil { pinchStart = model.readouts.zoomDisplay }
@@ -182,19 +205,33 @@ struct PreviewStage: View {
         )
     }
 
-    private func split(in size: CGSize) -> some View {
+    @ViewBuilder private func split(in size: CGSize) -> some View {
         let spacing: CGFloat = 12
-        let horizontalWidth = size.width - 24
-        let horizontalHeight = horizontalWidth * 9 / 16
-        let verticalHeight = max(120, size.height - horizontalHeight - spacing - 8)
-        let verticalWidth = min(size.width - 24, verticalHeight * 9 / 16)
-        return VStack(spacing: spacing) {
-            FormatTile(kind: .vertical, model: model, motion: motion)
-                .frame(width: verticalWidth, height: verticalWidth * 16 / 9)
-            FormatTile(kind: .horizontal, model: model, motion: motion, isPrimary: false)
-                .frame(width: horizontalWidth, height: horizontalHeight)
+        if size.width > size.height {
+            // Landscape: side by side, both as tall as possible.
+            let height = size.height - 8
+            let verticalWidth = height * 9 / 16
+            let horizontalWidth = min(size.width - verticalWidth - spacing - 16, height * 16 / 9)
+            HStack(spacing: spacing) {
+                FormatTile(kind: .vertical, model: model, motion: motion, isPrimary: false)
+                    .frame(width: verticalWidth, height: height)
+                FormatTile(kind: .horizontal, model: model, motion: motion)
+                    .frame(width: horizontalWidth, height: horizontalWidth * 9 / 16)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            let horizontalWidth = size.width - 24
+            let horizontalHeight = horizontalWidth * 9 / 16
+            let verticalHeight = max(120, size.height - horizontalHeight - spacing - 8)
+            let verticalWidth = min(size.width - 24, verticalHeight * 9 / 16)
+            VStack(spacing: spacing) {
+                FormatTile(kind: .vertical, model: model, motion: motion)
+                    .frame(width: verticalWidth, height: verticalWidth * 16 / 9)
+                FormatTile(kind: .horizontal, model: model, motion: motion, isPrimary: false)
+                    .frame(width: horizontalWidth, height: horizontalHeight)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// The secondary format sits in a fixed spot at the bottom; its button makes it bigger or smaller.
@@ -203,9 +240,10 @@ struct PreviewStage: View {
         let primary = model.config.pipPrimary == .horizontal ? OutputKind.horizontal : OutputKind.vertical
         let secondary: OutputKind = primary == .vertical ? .horizontal : .vertical
         let large = model.config.pipLarge
+        let base = min(size.width, size.height * (size.width > size.height ? 1.6 : 1))
         let smallWidth: CGFloat = secondary == .horizontal
-            ? size.width * (large ? 0.86 : 0.46)
-            : size.width * (large ? 0.44 : 0.26)
+            ? base * (large ? 0.86 : 0.46)
+            : base * (large ? 0.44 : 0.26)
         return ZStack(alignment: .bottom) {
             Color.clear.allowsHitTesting(false)
 
@@ -234,22 +272,40 @@ struct PreviewStage: View {
     }
 }
 
-/// Histogram, audio meter and recording / long-exposure badge. Observes only the fast meters.
+/// Histogram, audio meter, timers and status badges. Observes only the fast meters.
 private struct PreviewHUD: View {
     @ObservedObject var model: CameraModel
     @ObservedObject var meters: LiveMeters
 
     var body: some View {
-        VStack {
-            HStack(alignment: .top) {
-                if model.config.showHistogram { HistogramView(values: meters.histogram) }
+        ZStack {
+            VStack {
+                HStack(alignment: .top) {
+                    if model.config.showHistogram { HistogramView(values: meters.histogram) }
+                    Spacer()
+                    if model.aeafLocked {
+                        Text("AE/AF TRAVADO")
+                            .font(.system(size: 11, weight: .heavy))
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(Color.yellow, in: Capsule())
+                    }
+                }
+                .overlay(alignment: .top) { badge }
                 Spacer()
             }
-            .overlay(alignment: .top) { badge }
-            Spacer()
+            .padding(.horizontal, 16)
+            .padding(.top, 6)
+
+            if let countdown = model.countdown {
+                Text("\(countdown)")
+                    .font(.system(size: 96, weight: .thin).monospacedDigit())
+                    .foregroundStyle(.white)
+                    .shadow(radius: 8)
+                    .contentTransition(.numericText())
+                    .animation(.snappy, value: countdown)
+            }
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 6)
         .overlay(alignment: .trailing) {
             if model.config.audioMeter && model.config.mode == .video {
                 AudioMeter(level: meters.audioLevel).padding(.trailing, 4)
@@ -278,6 +334,14 @@ private struct PreviewHUD: View {
             .foregroundStyle(.white)
             .padding(.horizontal, 12).padding(.vertical, 6)
             .background(.black.opacity(0.6), in: Capsule())
+        } else if model.isBusy && model.config.mode == .photo {
+            HStack(spacing: 8) {
+                ProgressView().tint(.white)
+                Text("Processando foto…").font(.system(size: 13, weight: .semibold))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(.black.opacity(0.6), in: Capsule())
         }
     }
 }
@@ -285,24 +349,26 @@ private struct PreviewHUD: View {
 /// In the window layout the main format fills the whole screen behind the controls, like the original.
 struct FullScreenPrimary: View {
     @ObservedObject var model: CameraModel
-    @ObservedObject var motion: LevelMotion
+    let motion: LevelMotion
     @State private var pinchStart: CGFloat?
 
     var body: some View {
         let primary: OutputKind = model.config.pipPrimary == .horizontal ? .horizontal : .vertical
         GeometryReader { geo in
+            let landscape = geo.size.width > geo.size.height
+            // Fill edge to edge when the format matches the screen's shape; otherwise show it whole.
+            let fills = (primary == .vertical) != landscape
             Group {
-                if primary == .vertical {
-                    FormatTile(kind: .vertical, model: model, motion: motion, fullBleed: true)
+                if fills {
+                    FormatTile(kind: primary, model: model, motion: motion, fullBleed: true)
                         .frame(width: geo.size.width, height: geo.size.height)
                 } else {
-                    // 16:9 can't fill a portrait screen without losing most of it: show it whole, centered.
-                    FormatTile(kind: .horizontal, model: model, motion: motion)
-                        .frame(width: geo.size.width)
+                    FormatTile(kind: primary, model: model, motion: motion)
+                        .frame(maxWidth: geo.size.width, maxHeight: geo.size.height)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
-            .gesture(
+            .simultaneousGesture(
                 MagnificationGesture()
                     .onChanged { scale in
                         if pinchStart == nil { pinchStart = model.readouts.zoomDisplay }
@@ -313,5 +379,16 @@ struct FullScreenPrimary: View {
             )
         }
         .ignoresSafeArea()
+    }
+}
+
+private extension View {
+    /// Locks the aspect ratio, or leaves the view free to fill its frame when `ratio` is nil.
+    @ViewBuilder func keepingAspect(_ ratio: CGFloat?) -> some View {
+        if let ratio {
+            aspectRatio(ratio, contentMode: .fit)
+        } else {
+            self
+        }
     }
 }

@@ -62,16 +62,19 @@ enum PhotoFusion {
             "inputBVector": CIVector(x: 0, y: 0, z: k, w: 0),
             "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1),
         ])
+        // Addition also summed alpha (to N). Left as is, encoders divide the colour by it: a photo N× too dark.
+        .settingAlphaOne(in: output)
 
         if toneMap {
-            // The burst was shot ~0.7 EV under to keep highlights; open the shadows back up.
+            // The burst was shot 0.7 EV under so highlights kept detail. The merged half-float image holds
+            // values above 1, so: bring exposure back up, then roll the highlights off and open the shadows.
+            result = result.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: 0.7])
             result = result.applyingFilter("CIHighlightShadowAdjust", parameters: [
-                "inputShadowAmount": 0.55,
-                "inputHighlightAmount": 0.9,
+                "inputShadowAmount": 0.35,
+                "inputHighlightAmount": 0.7,
                 "inputRadius": 12 * upscale,
             ])
-            result = result.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: 0.35])
-            result = result.applyingFilter("CIVibrance", parameters: ["inputAmount": 0.15])
+            result = result.applyingFilter("CIVibrance", parameters: ["inputAmount": 0.12])
         }
         // Merged frames are clean enough to take real sharpening without amplifying noise.
         result = result.applyingFilter("CIUnsharpMask", parameters: [

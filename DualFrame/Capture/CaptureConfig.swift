@@ -216,7 +216,9 @@ struct CaptureConfig: Codable, Equatable {
     var lens: LensChoice = .wide
     /// `FormatInfo.id` of a sensor format chosen by hand, or nil for automatic.
     var formatOverride: String? = nil
-    var followDeviceRotation = false
+    /// The interface rotates with the phone and files follow the way it is held.
+    /// Off: everything stays upright-portrait.
+    var followDeviceRotation = true
     var mirrorFront = true
 
     var layout: PreviewLayout = .split
@@ -227,6 +229,11 @@ struct CaptureConfig: Codable, Equatable {
     var showCrosshair = false
     var showLevel = true
     var showHistogram = false
+    /// Diagonal stripes over areas about to clip.
+    var zebra = false
+    /// Colours in-focus edges.
+    var focusPeaking = false
+    var timerSeconds = 0
     var audioMeter = true
     var saveToPhotos = false
     var keepManualControls = false
@@ -267,12 +274,22 @@ struct CaptureConfig: Codable, Equatable {
         "\(mode.rawValue)|\(lens.rawValue)|\(requiredFormatWidth)|\(fps)|\(dynamicRange.rawValue)|\(rawPhoto)|\(stabilization.rawValue)|\(formatOverride ?? "-")"
     }
 
-    static let storageKey = "captureConfig.v3"
+    static let storageKey = "captureConfig.v4"
 
+    /// Saved values are laid over the defaults, so new settings added in an update don't wipe the old ones.
     static func load() -> CaptureConfig {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let cfg = try? JSONDecoder().decode(CaptureConfig.self, from: data) else { return CaptureConfig() }
-        return cfg
+        let defaults = CaptureConfig()
+        let current = UserDefaults.standard.data(forKey: storageKey)
+        guard let saved = current ?? UserDefaults.standard.data(forKey: "captureConfig.v3"),
+              var savedObject = try? JSONSerialization.jsonObject(with: saved) as? [String: Any],
+              let defaultData = try? JSONEncoder().encode(defaults),
+              var merged = try? JSONSerialization.jsonObject(with: defaultData) as? [String: Any] else { return defaults }
+        // 1.4 turned rotation on by default; don't carry the old "off" over from 1.3.
+        if current == nil { savedObject["followDeviceRotation"] = nil }
+        merged.merge(savedObject) { _, new in new }
+        guard let mergedData = try? JSONSerialization.data(withJSONObject: merged),
+              let config = try? JSONDecoder().decode(CaptureConfig.self, from: mergedData) else { return defaults }
+        return config
     }
 
     func save() {
