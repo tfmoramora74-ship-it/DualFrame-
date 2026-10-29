@@ -318,7 +318,7 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
             return (plan.kind, renderer.image(from: pixelBuffer, crop: plan.crop, rotation: rotation,
                                               mirror: request.mirror, size: size))
         }
-        let renderer = self.renderer
+        let encoder = self.renderer
         photoQueue.async {
             var urls: [URL] = []
             var failure: String?
@@ -326,7 +326,7 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
                 try FileManager.default.createDirectory(at: request.folder, withIntermediateDirectories: true)
                 for (kind, image) in images {
                     let url = request.folder.appendingPathComponent("\(request.baseName)_\(kind.fileSuffix).heic")
-                    try renderer.writeHEIC(image, to: url)
+                    try encoder.writeHEIC(image, to: url)
                     urls.append(url)
                 }
             } catch {
