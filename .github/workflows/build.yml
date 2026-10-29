@@ -31,8 +31,15 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            build | tee build.log | grep -E "error:|warning: unre|BUILD (SUCCEEDED|FAILED)" || true
-          test -d build/Build/Products/Release-iphoneos/DualFrame.app
+            build > build.log 2>&1 || true
+          grep -E "BUILD (SUCCEEDED|FAILED)" build.log || true
+          if [ ! -d build/Build/Products/Release-iphoneos/DualFrame.app ]; then
+            # Surface compiler errors as public annotations.
+            grep -E "error:" build.log | sort -u | head -40 | while IFS= read -r line; do
+              echo "::error::$(echo "$line" | sed 's#.*/DualFrame/##')"
+            done
+            exit 1
+          fi
 
       - name: Package IPA
         run: |
