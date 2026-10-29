@@ -296,7 +296,8 @@ final class CameraModel: ObservableObject {
     private func photoRequest() -> PhotoRequest {
         let name = newTakeName()
         return PhotoRequest(outputs: config.outputs, rotationDegrees: captureRotation,
-                            mirror: isFront && config.mirrorFront, raw: config.rawPhoto,
+                            mirror: isFront && config.mirrorFront,
+                            raw: config.rawPhoto && config.photoProcessing == .apple,
                             folder: TakeStore.root.appendingPathComponent(name), baseName: name)
     }
 
@@ -305,8 +306,28 @@ final class CameraModel: ObservableObject {
         isBusy = true
         flashTrigger += 1
         UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
-        engine.capturePhoto(photoRequest()) { [weak self] result in
-            Task { @MainActor in self?.finished(result) }
+        let processing = config.photoProcessing
+        guard processing != .apple else {
+            engine.capturePhoto(photoRequest()) { [weak self] result in
+                Task { @MainActor in self?.finished(result) }
+            }
+            return
+        }
+        toast = processing == .superResolution ? "Segure firme… super-resolução" : "Segure firme… fundindo quadros"
+        let request = BurstRequest(photo: photoRequest(), processing: processing)
+        // HDR+ idea: shoot the burst a little under to protect highlights, then lift shadows after merging.
+        let underexpose = processing == .fusion && !manualExposure
+        let previousBias = readouts.exposureBias
+        if underexpose { setExposureBias(previousBias - 0.7) }
+        Task { [weak self] in
+            if underexpose { try? await Task.sleep(nanoseconds: 250_000_000) }
+            guard let self else { return }
+            self.engine.captureBurst(request) { [weak self] result in
+                Task { @MainActor in
+                    if underexpose { self?.setExposureBias(previousBias) }
+                    self?.finished(result)
+                }
+            }
         }
     }
 

@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 /// One file produced by a take. All of them are cut from the same sensor frame.
@@ -93,6 +94,32 @@ enum DynamicRange: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// How photos are processed.
+enum PhotoProcessing: String, Codable, CaseIterable, Identifiable {
+    /// Apple's own pipeline (Deep Fusion / Smart HDR); the only one that can also save RAW.
+    case apple
+    /// 8-frame aligned burst, shot slightly under and tone-mapped (HDR+-style).
+    case fusion
+    /// 10-frame aligned burst merged onto a 1.5× grid (~27 MP from a 12 MP sensor).
+    case superResolution
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .apple: return "Apple"
+        case .fusion: return "Fusão HDR"
+        case .superResolution: return "Super-res"
+        }
+    }
+    var frameCount: Int {
+        switch self {
+        case .apple: return 1
+        case .fusion: return 8
+        case .superResolution: return 10
+        }
+    }
+    var upscale: CGFloat { self == .superResolution ? 1.5 : 1 }
+}
+
 /// How long-exposure frames are combined.
 enum StackBlend: String, Codable, CaseIterable, Identifiable {
     /// Mean of all frames: less noise, stars stay points (astro, night scenes).
@@ -179,6 +206,7 @@ struct CaptureConfig: Codable, Equatable {
     var fps: Int = 30
     var dynamicRange: DynamicRange = .sdr
     var rawPhoto = false
+    var photoProcessing: PhotoProcessing = .fusion
     var longExposureSeconds = 10
     var longExposureBlend: StackBlend = .average
     var longExposureInfinityFocus = true
@@ -276,6 +304,11 @@ struct PhotoRequest {
     let raw: Bool
     let folder: URL
     let baseName: String
+}
+
+struct BurstRequest {
+    let photo: PhotoRequest
+    let processing: PhotoProcessing
 }
 
 struct LongExposureRequest {

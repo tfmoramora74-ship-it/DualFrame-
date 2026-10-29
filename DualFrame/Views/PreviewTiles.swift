@@ -50,8 +50,12 @@ struct FormatTile: View {
     @ObservedObject var motion: LevelMotion
     var isPrimary = true
     var compact = false
+    /// Fills the whole screen edge to edge (aspect fill) instead of showing the exact frame.
+    var fullBleed = false
 
     @State private var focusPoint: CGPoint?
+
+    private var cornerRadius: CGFloat { fullBleed ? 0 : (compact ? 10 : 16) }
 
     var body: some View {
         let enabled = model.config.isEnabled(kind)
@@ -77,6 +81,7 @@ struct FormatTile: View {
                         .position(x: focusPoint.x * geo.size.width, y: focusPoint.y * geo.size.height)
                 }
 
+                if !fullBleed {
                 VStack {
                     Spacer()
                     Text(caption(enabled: enabled))
@@ -86,13 +91,14 @@ struct FormatTile: View {
                         .background(.black.opacity(0.35), in: Capsule())
                         .padding(.bottom, compact ? 4 : 8)
                 }
+                }
             }
             .contentShape(Rectangle())
             // Compact windows leave taps to their parent (swap); full tiles tap to focus.
             .gesture(SpatialTapGesture().onEnded { value in
                 guard enabled else { return }
                 let point = CGPoint(x: value.location.x / geo.size.width, y: value.location.y / geo.size.height)
-                model.focus(at: point, in: kind)
+                model.focus(at: contentPoint(value.location, in: geo.size), in: kind)
                 withAnimation(.easeOut(duration: 0.15)) { focusPoint = point }
                 Task {
                     try? await Task.sleep(nanoseconds: 1_200_000_000)
@@ -100,13 +106,23 @@ struct FormatTile: View {
                 }
             }, including: compact ? .none : .all)
         }
-        .aspectRatio(kind.uprightAspect, contentMode: .fit)
-        .clipShape(RoundedRectangle(cornerRadius: compact ? 10 : 16, style: .continuous))
+        .aspectRatio(fullBleed ? nil : CGFloat(kind.uprightAspect), contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: compact ? 10 : 16, style: .continuous)
-                .strokeBorder(model.isRecording && enabled ? Color.red.opacity(0.9) : Color.white.opacity(0.18),
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .strokeBorder(model.isRecording && enabled ? Color.red.opacity(0.9) : Color.white.opacity(fullBleed ? 0 : 0.18),
                               lineWidth: model.isRecording && enabled ? 2 : 1)
         )
+    }
+
+    /// Maps a tap in the view to 0...1 of the format's frame, undoing aspect-fill cropping.
+    private func contentPoint(_ location: CGPoint, in size: CGSize) -> CGPoint {
+        let aspect = CGFloat(kind.uprightAspect)
+        let contentWidth = max(size.width, size.height * aspect)
+        let contentHeight = max(size.height, size.width / aspect)
+        let x = (location.x + (contentWidth - size.width) / 2) / contentWidth
+        let y = (location.y + (contentHeight - size.height) / 2) / contentHeight
+        return CGPoint(x: min(max(x, 0), 1), y: min(max(y, 0), 1))
     }
 
     private func caption(enabled: Bool) -> String {
@@ -135,7 +151,7 @@ struct PreviewStage: View {
     @ObservedObject var motion: LevelMotion
     @State private var pinchStart: CGFloat?
 
-    private var onlyFull: Bool {
+    var onlyFull: Bool {
         !model.config.isEnabled(.vertical) && !model.config.isEnabled(.horizontal) && model.config.isEnabled(.full)
     }
 
@@ -188,12 +204,10 @@ struct PreviewStage: View {
         let secondary: OutputKind = primary == .vertical ? .horizontal : .vertical
         let large = model.config.pipLarge
         let smallWidth: CGFloat = secondary == .horizontal
-            ? size.width * (large ? 0.72 : 0.42)
-            : size.width * (large ? 0.42 : 0.24)
+            ? size.width * (large ? 0.86 : 0.46)
+            : size.width * (large ? 0.44 : 0.26)
         return ZStack(alignment: .bottom) {
-            FormatTile(kind: primary, model: model, motion: motion)
-                .frame(maxWidth: size.width - 16, maxHeight: size.height)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Color.clear.allowsHitTesting(false)
 
             FormatTile(kind: secondary, model: model, motion: motion, isPrimary: false, compact: true)
                 .frame(width: smallWidth)
@@ -215,7 +229,7 @@ struct PreviewStage: View {
                     .accessibilityLabel(large ? "Diminuir janela" : "Aumentar janela")
                 }
                 .shadow(color: .black.opacity(0.5), radius: 10, y: 4)
-                .padding(.bottom, 20)
+                .padding(.bottom, 8)
         }
     }
 }
@@ -265,5 +279,39 @@ private struct PreviewHUD: View {
             .padding(.horizontal, 12).padding(.vertical, 6)
             .background(.black.opacity(0.6), in: Capsule())
         }
+    }
+}
+
+/// In the window layout the main format fills the whole screen behind the controls, like the original.
+struct FullScreenPrimary: View {
+    @ObservedObject var model: CameraModel
+    @ObservedObject var motion: LevelMotion
+    @State private var pinchStart: CGFloat?
+
+    var body: some View {
+        let primary: OutputKind = model.config.pipPrimary == .horizontal ? .horizontal : .vertical
+        GeometryReader { geo in
+            Group {
+                if primary == .vertical {
+                    FormatTile(kind: .vertical, model: model, motion: motion, fullBleed: true)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                } else {
+                    // 16:9 can't fill a portrait screen without losing most of it: show it whole, centered.
+                    FormatTile(kind: .horizontal, model: model, motion: motion)
+                        .frame(width: geo.size.width)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .gesture(
+                MagnificationGesture()
+                    .onChanged { scale in
+                        if pinchStart == nil { pinchStart = model.readouts.zoomDisplay }
+                        let range = model.zoomRange
+                        model.setZoom(display: min(max((pinchStart ?? 1) * scale, range.lowerBound), range.upperBound))
+                    }
+                    .onEnded { _ in pinchStart = nil }
+            )
+        }
+        .ignoresSafeArea()
     }
 }

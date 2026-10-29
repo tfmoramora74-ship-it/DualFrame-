@@ -73,6 +73,7 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
     private var writer: TakeWriter?
     private var stack: (request: LongExposureRequest, stacker: FrameStacker?, start: CMTime,
                         completion: @Sendable (TakeResult) -> Void)?
+    private var burst: (request: BurstRequest, frames: [CVPixelBuffer], completion: @Sendable (TakeResult) -> Void)?
     private var awaitingFirstFrame = false
     private var frameCount = 0
     private var audioCount = 0
@@ -470,6 +471,59 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
         return urls
     }
 
+    // MARK: Burst photos (multi-frame fusion / super resolution)
+
+    func captureBurst(_ request: BurstRequest, completion: @escaping @Sendable (TakeResult) -> Void) {
+        outputQueue.async {
+            self.burst = (request, [], completion)
+        }
+    }
+
+    private func collectBurst(_ pixelBuffer: CVPixelBuffer) {
+        guard var current = burst else { return }
+        // Copy: capture buffers come from a small pool that must keep flowing.
+        let size = CGSize(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
+        let source = FrameRenderer.source(pixelBuffer, colorManaged: false)
+        if let copy = renderer.render(source, size: size, format: CVPixelBufferGetPixelFormatType(pixelBuffer),
+                                      colorSpace: nil, tagsFrom: pixelBuffer) {
+            current.frames.append(copy)
+        }
+        burst = current
+        guard current.frames.count >= current.request.processing.frameCount else { return }
+        burst = nil
+
+        let request = current.request
+        let frames = current.frames
+        let completion = current.completion
+        let context = renderer.context
+        photoQueue.async {
+            guard let fused = PhotoFusion.fuse(frames: frames, upscale: request.processing.upscale,
+                                               toneMap: request.processing == .fusion, context: context) else {
+                completion(TakeResult(folder: nil, urls: [], droppedFrames: 0, error: "Não foi possível fundir os quadros."))
+                return
+            }
+            do {
+                let urls = try self.writeCrops(of: Self.upright(fused.image, request: request.photo), request: request.photo)
+                completion(TakeResult(folder: request.photo.folder, urls: urls, droppedFrames: 0, error: nil))
+            } catch {
+                completion(TakeResult(folder: request.photo.folder, urls: [], droppedFrames: 0,
+                                      error: error.localizedDescription))
+            }
+        }
+    }
+
+    /// Turns a sensor-orientation still upright (and mirrors it for the front camera if asked).
+    private static func upright(_ image: CIImage, request: PhotoRequest) -> CIImage {
+        var image = image
+        if let orientation = FrameRenderer.orientation(for: CropMath.normalizedRotation(request.rotationDegrees)) {
+            image = image.oriented(orientation)
+        }
+        if request.mirror {
+            image = image.transformed(by: CGAffineTransform(scaleX: -1, y: 1).translatedBy(x: -image.extent.width, y: 0))
+        }
+        return image
+    }
+
     // MARK: Long exposure (frame stacking)
 
     func startLongExposure(_ request: LongExposureRequest, completion: @escaping @Sendable (TakeResult) -> Void) {
@@ -507,12 +561,7 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
         stack = nil
 
         let request = current.request.photo
-        let rotation = CropMath.normalizedRotation(request.rotationDegrees)
-        var image = stacker.result()
-        if let orientation = FrameRenderer.orientation(for: rotation) { image = image.oriented(orientation) }
-        if request.mirror {
-            image = image.transformed(by: CGAffineTransform(scaleX: -1, y: 1).translatedBy(x: -image.extent.width, y: 0))
-        }
+        let image = Self.upright(stacker.result(), request: request)
         let frames = stacker.count
         let completion = current.completion
         photoQueue.async {
@@ -696,6 +745,7 @@ extension CaptureEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             }
             writer?.appendVideo(sampleBuffer, pixelBuffer: pixelBuffer)
             if stack != nil { stackFrame(pixelBuffer, time: time) }
+            if burst != nil { collectBurst(pixelBuffer) }
             pushPreviews(pixelBuffer, time: time)
 
             frameCount += 1

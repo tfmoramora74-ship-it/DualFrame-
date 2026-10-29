@@ -17,6 +17,20 @@ struct CameraScreen: View {
         ZStack {
             Color(white: 0.11).ignoresSafeArea()
 
+            if !model.denied, model.config.layout == .pip, !fullOnly {
+                FullScreenPrimary(model: model, motion: motion)
+                // Keeps the controls legible over a bright scene.
+                VStack(spacing: 0) {
+                    LinearGradient(colors: [.black.opacity(0.45), .clear], startPoint: .top, endPoint: .bottom)
+                        .frame(height: 120)
+                    Spacer()
+                    LinearGradient(colors: [.clear, .black.opacity(0.55)], startPoint: .top, endPoint: .bottom)
+                        .frame(height: 260)
+                }
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+            }
+
             if model.denied {
                 permissionView
             } else {
@@ -117,7 +131,7 @@ struct CameraScreen: View {
                         chipValue(primaryResolutionLabel, sub: "RES")
                         chipValue("\(Int(model.state.fps))", sub: rangeBadge)
                     case .photo:
-                        chipValue("FOTO", sub: model.config.rawPhoto ? "RAW" : "HEIC")
+                        chipValue(photoChip, sub: model.config.photoProcessing == .apple && model.config.rawPhoto ? "RAW" : "FOTO")
                     case .longExposure:
                         chipValue("\(model.config.longExposureSeconds)s", sub: "EXP")
                     }
@@ -156,6 +170,19 @@ struct CameraScreen: View {
         }
         .padding(.horizontal, 14)
         .padding(.top, 4)
+    }
+
+    private var photoChip: String {
+        switch model.config.photoProcessing {
+        case .apple: return "APPLE"
+        case .fusion: return "HDR+"
+        case .superResolution: return "27MP"
+        }
+    }
+
+    /// Only the 4:3 file is on: a single framed preview, no window layout.
+    private var fullOnly: Bool {
+        !model.config.isEnabled(.vertical) && !model.config.isEnabled(.horizontal) && model.config.isEnabled(.full)
     }
 
     private var rangeBadge: String {
@@ -476,11 +503,20 @@ struct FormatPanel: View {
                     }
                 }
             case .photo:
-                row("RAW") {
-                    option("Off", selected: !model.config.rawPhoto) { model.config.rawPhoto = false }
-                    option("DNG", selected: model.config.rawPhoto) { model.config.rawPhoto = true }
+                row("PROCESSO") {
+                    ForEach(PhotoProcessing.allCases) { processing in
+                        option(processing.label, selected: model.config.photoProcessing == processing) {
+                            model.config.photoProcessing = processing
+                        }
+                    }
                 }
-                Text("RAW salva um DNG do sensor inteiro, além dos recortes em HEIC.")
+                if model.config.photoProcessing == .apple {
+                    row("RAW") {
+                        option("Off", selected: !model.config.rawPhoto) { model.config.rawPhoto = false }
+                        option("DNG", selected: model.config.rawPhoto) { model.config.rawPhoto = true }
+                    }
+                }
+                Text(processingHelp)
                     .font(.system(size: 11)).foregroundStyle(.white.opacity(0.55))
             case .longExposure:
                 Text("Duração e modo ficam logo acima do disparador.")
@@ -496,6 +532,14 @@ struct FormatPanel: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         .environment(\.colorScheme, .dark)
+    }
+
+    private var processingHelp: String {
+        switch model.config.photoProcessing {
+        case .apple: return "Processamento do iPhone (Deep Fusion / Smart HDR). Único com opção RAW (DNG do sensor inteiro)."
+        case .fusion: return "Rajada de 8 quadros alinhados e fundidos: menos ruído, sombras abertas e altas luzes preservadas."
+        case .superResolution: return "Rajada de 10 quadros com micro-deslocamentos da mão fundidos numa grade 1,5×: ~27 MP e mais detalhe. Segure firme ~0,5 s."
+        }
     }
 
     private func row<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
