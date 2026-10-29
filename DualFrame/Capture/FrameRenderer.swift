@@ -50,9 +50,20 @@ final class FrameRenderer: @unchecked Sendable {
         let extent = image.extent
         guard extent.width != size.width || extent.height != size.height else { return image }
         let scaleX = size.width / extent.width, scaleY = size.height / extent.height
+        let target = CGRect(origin: .zero, size: size)
+        if min(scaleX, scaleY) < 0.8 {
+            // Shrinking a 12 MP frame with plain bilinear sampling skips pixels: jagged edges and moiré.
+            // Lanczos low-passes first, so HD files and previews stay clean.
+            return image.clampedToExtent()
+                .applyingFilter("CILanczosScaleTransform", parameters: [
+                    kCIInputScaleKey: scaleY,
+                    kCIInputAspectRatioKey: scaleX / scaleY,
+                ])
+                .cropped(to: target)
+        }
         return image.clampedToExtent()
             .transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
-            .cropped(to: CGRect(origin: .zero, size: size))
+            .cropped(to: target)
     }
 
     func image(from buffer: CVPixelBuffer, crop: CGRect, rotation: Int, mirror: Bool = false, size: CGSize,

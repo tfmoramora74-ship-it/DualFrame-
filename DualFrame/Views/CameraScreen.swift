@@ -144,37 +144,40 @@ struct CameraScreen: View {
     /// Phone on its side: preview on the left, controls in a column on the right (like the Camera app).
     private var landscapeLayout: some View {
         HStack(spacing: 0) {
-            VStack(spacing: 12) {
+            // Left rail: settings chip and tools.
+            VStack(alignment: .leading, spacing: 12) {
                 formatChip
                 toolsCapsule(axis: .vertical)
                 Spacer(minLength: 0)
             }
-            .padding(.leading, 8)
-            .padding(.vertical, 8)
+            .padding(.leading, 10)
+            .padding(.vertical, 10)
 
+            // Center: preview, with zoom and panels floating at its bottom edge.
             ZStack(alignment: .bottom) {
                 PreviewStage(model: model, motion: model.motion)
                 VStack(spacing: 8) {
+                    panels.frame(maxWidth: 480)
                     statusLine
-                    panels.frame(maxWidth: 460)
+                    LensRow(model: model, readouts: model.readouts, axis: .horizontal)
                 }
-                .padding(.bottom, 8)
+                .padding(.bottom, 10)
             }
-            .padding(.horizontal, 8)
+            .padding(.horizontal, 6)
 
-            HStack(spacing: 10) {
-                LensRow(model: model, readouts: model.readouts, axis: .vertical)
-                VStack(spacing: 16) {
-                    galleryButton
-                    Spacer(minLength: 0)
-                    shutter
-                    Spacer(minLength: 0)
-                    layoutButton
-                }
-                .padding(.vertical, 8)
+            // Right rail, like the Camera app: modes beside a shutter column.
+            HStack(spacing: 8) {
                 modePicker(axis: .vertical)
+                VStack(spacing: 0) {
+                    layoutButton
+                    Spacer(minLength: 12)
+                    shutter
+                    Spacer(minLength: 12)
+                    galleryButton
+                }
+                .padding(.vertical, 14)
             }
-            .padding(.trailing, 8)
+            .padding(.trailing, 10)
         }
     }
 
@@ -234,6 +237,7 @@ struct CameraScreen: View {
             }
             .padding(.horizontal, 16)
             .frame(height: 44)
+            .fixedSize()
             .background(.black.opacity(0.55), in: Capsule())
         }
         .disabled(model.isRecording)
@@ -367,6 +371,8 @@ struct CameraScreen: View {
             Text(value).font(.system(size: 17, weight: .bold))
             Text(sub).font(.system(size: 8, weight: .bold)).foregroundStyle(Color.accentTeal).offset(y: 1)
         }
+        .lineLimit(1)
+        .fixedSize()
         .foregroundStyle(.white)
     }
 
@@ -617,6 +623,14 @@ struct FormatPanel: View {
                 row("FRAME RATE") {
                     ForEach([24, 25, 30, 60], id: \.self) { fps in
                         option("\(fps)", selected: model.config.fps == fps) { model.config.fps = fps }
+                    }
+                }
+                row("PRIORIDADE") {
+                    option("Nitidez", selected: !model.config.preferStabilization) {
+                        model.config.preferStabilization = false
+                    }
+                    option("Estabilização", selected: model.config.preferStabilization) {
+                        model.config.preferStabilization = true
                     }
                 }
                 row("COR") {

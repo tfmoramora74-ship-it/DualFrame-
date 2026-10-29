@@ -237,20 +237,24 @@ struct PreviewStage: View {
     /// The secondary format sits in a fixed spot at the bottom; its button makes it bigger or smaller.
     /// Tapping the window swaps which format is the big one.
     private func pip(in size: CGSize) -> some View {
-        let primary = model.config.pipPrimary == .horizontal ? OutputKind.horizontal : OutputKind.vertical
+        let landscape = size.width > size.height
+        let primary = model.config.pipMain(landscape: landscape)
         let secondary: OutputKind = primary == .vertical ? .horizontal : .vertical
         let large = model.config.pipLarge
         let base = min(size.width, size.height * (size.width > size.height ? 1.6 : 1))
         let smallWidth: CGFloat = secondary == .horizontal
             ? base * (large ? 0.86 : 0.46)
             : base * (large ? 0.44 : 0.26)
-        return ZStack(alignment: .bottom) {
+        // Landscape keeps the bottom centre free for the zoom buttons.
+        return ZStack(alignment: landscape ? .bottomTrailing : .bottom) {
             Color.clear.allowsHitTesting(false)
 
             FormatTile(kind: secondary, model: model, motion: motion, isPrimary: false, compact: true)
                 .frame(width: smallWidth)
                 .onTapGesture {
-                    withAnimation(.spring(duration: 0.35)) { model.config.pipPrimary = secondary }
+                    withAnimation(.spring(duration: 0.35)) {
+                        model.config.pipPrimary = model.config.pipPrimary == .horizontal ? .vertical : .horizontal
+                    }
                 }
                 .overlay(alignment: .bottomTrailing) {
                     Button {
@@ -268,6 +272,7 @@ struct PreviewStage: View {
                 }
                 .shadow(color: .black.opacity(0.5), radius: 10, y: 4)
                 .padding(.bottom, 8)
+                .padding(.trailing, landscape ? 8 : 0)
         }
     }
 }
@@ -353,9 +358,9 @@ struct FullScreenPrimary: View {
     @State private var pinchStart: CGFloat?
 
     var body: some View {
-        let primary: OutputKind = model.config.pipPrimary == .horizontal ? .horizontal : .vertical
         GeometryReader { geo in
             let landscape = geo.size.width > geo.size.height
+            let primary = model.config.pipMain(landscape: landscape)
             // Fill edge to edge when the format matches the screen's shape; otherwise show it whole.
             let fills = (primary == .vertical) != landscape
             Group {

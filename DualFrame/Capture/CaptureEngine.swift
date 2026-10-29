@@ -150,7 +150,8 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
         for (kind, layers) in sinks {
             let crop = CropMath.region(kind: kind, width: width, height: height, verticalIsBufferX: verticalIsBufferX)
             let upright = CropMath.uprightSize(crop.size, rotationDegrees: Double(rotation))
-            let scale = min(1, 960 / max(upright.width, upright.height))
+            // Full-screen previews need close to screen resolution or they look blocky.
+            let scale = min(1, 1920 / max(upright.width, upright.height))
             let size = CGSize(width: CropMath.even(upright.width * scale), height: CropMath.even(upright.height * scale))
             var image = renderer.image(from: source, crop: crop, rotation: rotation, mirror: spec.mirror, size: size)
             if spec.peaking { image = Self.peaking(image) }
@@ -745,16 +746,18 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
                 let anyStable = stabilized(pool)
                 if !bigStable.isEmpty {
                     pool = bigStable
-                } else if !wantsBig, !anyStable.isEmpty {
-                    // Everything is HD: a stabilized smaller sensor mode beats an unstabilized full one.
+                } else if config.preferStabilization, !wantsBig, !anyStable.isEmpty {
+                    // The user chose steadiness over detail: largest sensor mode that stabilizes.
                     pool = anyStable
                     if !big.isEmpty {
                         let d = dimensions(anyStable.max(by: { area($0) < area($1) })!)
-                        notes.append("Estabilização usa o sensor \(d.width)×\(d.height): o modo de sensor completo deste iPhone não estabiliza.")
+                        notes.append("Prioridade estabilização: sensor \(d.width)×\(d.height), menos nitidez que o sensor completo.")
                     }
                 } else if !big.isEmpty {
                     pool = big
-                    notes.append("Neste iPhone o sensor completo (4K) não tem estabilização. Use HD para filmar na mão.")
+                    notes.append(wantsBig || anyStable.isEmpty
+                        ? "Neste iPhone o sensor completo (4K) não estabiliza. Use HD com prioridade Estabilização para filmar na mão."
+                        : "Sensor completo (mais nítido) sem estabilização. Para filmar na mão, mude a prioridade para Estabilização.")
                 }
             } else if !big.isEmpty {
                 pool = big

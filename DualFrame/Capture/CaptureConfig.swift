@@ -206,13 +206,16 @@ struct CaptureConfig: Codable, Equatable {
     var fps: Int = 30
     var dynamicRange: DynamicRange = .sdr
     var rawPhoto = false
-    var photoProcessing: PhotoProcessing = .fusion
+    var photoProcessing: PhotoProcessing = .apple
     var longExposureSeconds = 10
     var longExposureBlend: StackBlend = .average
     var longExposureInfinityFocus = true
     var codec: VideoCodecChoice = .hevc
     var quality: BitrateQuality = .high
     var stabilization: StabilizationChoice = .standard
+    /// When the full-sensor mode can't stabilize (iPhone 13 Pro and others): false keeps the
+    /// full 4032×3024 sensor (sharpest), true drops to the largest mode that does stabilize.
+    var preferStabilization = false
     var lens: LensChoice = .wide
     /// `FormatInfo.id` of a sensor format chosen by hand, or nil for automatic.
     var formatOverride: String? = nil
@@ -256,6 +259,13 @@ struct CaptureConfig: Codable, Equatable {
 
     func isEnabled(_ kind: OutputKind) -> Bool { outputs.contains(kind) }
 
+    /// The big format in the window layout: the one that matches how the phone is held,
+    /// unless the user swapped them (stored as `pipPrimary == .horizontal`).
+    func pipMain(landscape: Bool) -> OutputKind {
+        let swapped = pipPrimary == .horizontal
+        return swapped != landscape ? .horizontal : .vertical
+    }
+
     mutating func setEnabled(_ kind: OutputKind, _ on: Bool) {
         var set = outputs.filter { $0 != kind }
         if on { set.append(kind) }
@@ -271,21 +281,27 @@ struct CaptureConfig: Codable, Equatable {
 
     /// Fields that require rebuilding the capture session when changed.
     var sessionKey: String {
-        "\(mode.rawValue)|\(lens.rawValue)|\(requiredFormatWidth)|\(fps)|\(dynamicRange.rawValue)|\(rawPhoto)|\(stabilization.rawValue)|\(formatOverride ?? "-")"
+        "\(mode.rawValue)|\(lens.rawValue)|\(requiredFormatWidth)|\(preferStabilization)|\(fps)|\(dynamicRange.rawValue)|\(rawPhoto)|\(stabilization.rawValue)|\(formatOverride ?? "-")"
     }
 
-    static let storageKey = "captureConfig.v4"
+    static let storageKey = "captureConfig.v5"
 
     /// Saved values are laid over the defaults, so new settings added in an update don't wipe the old ones.
     static func load() -> CaptureConfig {
         let defaults = CaptureConfig()
-        let current = UserDefaults.standard.data(forKey: storageKey)
-        guard let saved = current ?? UserDefaults.standard.data(forKey: "captureConfig.v3"),
+        let store = UserDefaults.standard
+        let current = store.data(forKey: storageKey)
+        let previous = store.data(forKey: "captureConfig.v4")
+        guard let saved = current ?? previous ?? store.data(forKey: "captureConfig.v3"),
               var savedObject = try? JSONSerialization.jsonObject(with: saved) as? [String: Any],
               let defaultData = try? JSONEncoder().encode(defaults),
               var merged = try? JSONSerialization.jsonObject(with: defaultData) as? [String: Any] else { return defaults }
-        // 1.4 turned rotation on by default; don't carry the old "off" over from 1.3.
-        if current == nil { savedObject["followDeviceRotation"] = nil }
+        // Defaults that changed on purpose in an update are not carried over from older versions:
+        // rotation (on since 1.4) and photo processing (Apple again since 1.5).
+        if current == nil {
+            if previous == nil { savedObject["followDeviceRotation"] = nil }
+            savedObject["photoProcessing"] = nil
+        }
         merged.merge(savedObject) { _, new in new }
         guard let mergedData = try? JSONSerialization.data(withJSONObject: merged),
               let config = try? JSONDecoder().decode(CaptureConfig.self, from: mergedData) else { return defaults }
