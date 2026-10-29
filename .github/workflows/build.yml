@@ -33,7 +33,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build > build.log 2>&1 || true
           grep -E "BUILD (SUCCEEDED|FAILED)" build.log || true
-          if [ ! -d build/Build/Products/Release-iphoneos/DualFrame.app ]; then
+          if ! grep -q "BUILD SUCCEEDED" build.log || [ ! -f build/Build/Products/Release-iphoneos/DualFrame.app/DualFrame ]; then
             # Surface compiler errors as public annotations.
             grep -E "error:" build.log | sort -u | head -40 | while IFS= read -r line; do
               echo "::error::$(echo "$line" | sed 's#.*/DualFrame/##')"
