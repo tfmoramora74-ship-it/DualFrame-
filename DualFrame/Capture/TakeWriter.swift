@@ -2,16 +2,18 @@ import AVFoundation
 import VideoToolbox
 
 enum EncoderSettings {
-    static func video(size: CGSize, codec: VideoCodecChoice, fps: Double, hdr: Bool,
+    static func video(size: CGSize, codec: VideoCodecChoice, fps: Double, range: DynamicRange,
                       quality: BitrateQuality) -> [String: Any] {
-        // 10-bit H.264 does not exist on iPhone; HDR always goes to HEVC or ProRes.
-        let codec: VideoCodecChoice = (codec == .h264 && hdr) ? .hevc : codec
+        let tenBit = range != .sdr
+        // 10-bit H.264 does not exist on iPhone; HDR and Log always go to HEVC or ProRes.
+        let codec: VideoCodecChoice = (codec == .h264 && tenBit) ? .hevc : codec
 
         var settings: [String: Any] = [
             AVVideoWidthKey: Int(size.width),
             AVVideoHeightKey: Int(size.height),
-            AVVideoColorPropertiesKey: colorProperties(hdr: hdr),
         ]
+        // Log: no explicit tags, the encoder keeps the Apple Log tags carried by the buffers.
+        if let color = colorProperties(range) { settings[AVVideoColorPropertiesKey] = color }
 
         let pixelsPerSecond = Double(size.width * size.height) * fps
         switch codec {
@@ -21,7 +23,7 @@ enum EncoderSettings {
                 AVVideoAverageBitRateKey: Int(pixelsPerSecond * quality.bitsPerPixel),
                 AVVideoMaxKeyFrameIntervalKey: Int(fps.rounded()),
                 AVVideoExpectedSourceFrameRateKey: Int(fps.rounded()),
-                AVVideoProfileLevelKey: hdr
+                AVVideoProfileLevelKey: tenBit
                     ? kVTProfileLevel_HEVC_Main10_AutoLevel as String
                     : kVTProfileLevel_HEVC_Main_AutoLevel as String,
             ] as [String: Any]
@@ -39,8 +41,9 @@ enum EncoderSettings {
         return settings
     }
 
-    static func colorProperties(hdr: Bool) -> [String: Any] {
-        if hdr {
+    static func colorProperties(_ range: DynamicRange) -> [String: Any]? {
+        if range == .log { return nil }
+        if range == .hdr {
             return [
                 AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
                 AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
@@ -81,7 +84,7 @@ final class TakeWriter {
 
     let folder: URL
     private let renderer: FrameRenderer
-    private let hdr: Bool
+    private let range: DynamicRange
     private let mirror: Bool
     private var tracks: [Track] = []
     private var sessionStarted = false
@@ -92,7 +95,7 @@ final class TakeWriter {
          renderer: FrameRenderer) throws {
         folder = pending.folder
         self.renderer = renderer
-        hdr = pending.hdr
+        range = pending.dynamicRange
         mirror = pending.mirror
         try FileManager.default.createDirectory(at: pending.folder, withIntermediateDirectories: true)
 
@@ -104,7 +107,7 @@ final class TakeWriter {
             let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
 
             let videoSettings = EncoderSettings.video(size: plan.size, codec: pending.codec, fps: pending.fps,
-                                                      hdr: pending.hdr, quality: pending.quality)
+                                                      range: pending.dynamicRange, quality: pending.quality)
             let video = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
             video.expectsMediaDataInRealTime = true
             video.transform = plan.transform
@@ -137,7 +140,6 @@ final class TakeWriter {
             sessionStarted = true
         }
         let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
-        let colorSpace = hdr ? FrameRenderer.hdrVideoSpace : FrameRenderer.sdrVideoSpace
         for track in tracks where track.writer.status == .writing {
             guard track.video.isReadyForMoreMediaData else {
                 droppedFrames += 1
@@ -147,9 +149,10 @@ final class TakeWriter {
             if track.plan.isPassthrough && !mirror {
                 frame = pixelBuffer
             } else {
+                // Encoded values pass through unconverted, so SDR, HLG and Log stay bit-exact.
                 let image = renderer.image(from: pixelBuffer, crop: track.plan.crop, rotation: 0,
-                                           mirror: mirror, size: track.plan.size)
-                frame = renderer.render(image, size: track.plan.size, format: format, colorSpace: colorSpace,
+                                           mirror: mirror, size: track.plan.size, colorManaged: false)
+                frame = renderer.render(image, size: track.plan.size, format: format, colorSpace: nil,
                                         tagsFrom: pixelBuffer)
             }
             guard let frame else {

@@ -8,6 +8,7 @@ extension Color {
 }
 
 /// Shows the live, already-cropped frames the engine renders for one output.
+/// Several views may show the same format at once (e.g. during a layout animation).
 struct SampleBufferView: UIViewRepresentable {
     let kind: OutputKind
     let engine: CaptureEngine
@@ -15,13 +16,11 @@ struct SampleBufferView: UIViewRepresentable {
     func makeUIView(context: Context) -> DisplayView {
         let view = DisplayView()
         view.displayLayer.videoGravity = .resizeAspectFill
-        engine.setPreviewSink(view.displayLayer, for: kind)
+        engine.addPreviewSink(view.displayLayer, for: kind)
         return view
     }
 
-    func updateUIView(_ view: DisplayView, context: Context) {
-        engine.setPreviewSink(view.displayLayer, for: kind)
-    }
+    func updateUIView(_ view: DisplayView, context: Context) {}
 
     func makeCoordinator() -> Coordinator { Coordinator(kind: kind, engine: engine) }
 
@@ -44,7 +43,7 @@ struct SampleBufferView: UIViewRepresentable {
     }
 }
 
-/// One live format: preview, overlays, label, focus tap.
+/// One live format: preview, overlays, caption, focus tap.
 struct FormatTile: View {
     let kind: OutputKind
     @ObservedObject var model: CameraModel
@@ -60,11 +59,17 @@ struct FormatTile: View {
             ZStack {
                 SampleBufferView(kind: kind, engine: model.engine)
                     .opacity(enabled ? 1 : 0.35)
+                    .blur(radius: model.isSwitching ? 18 : 0)
+                    .animation(.easeOut(duration: 0.25), value: model.isSwitching)
 
                 if !compact {
                     if model.config.showGrid { GridOverlay() }
                     if model.config.showCrosshair { CrosshairOverlay() }
                     if model.config.showLevel && isPrimary { LevelOverlay(motion: motion) }
+                }
+
+                if model.isSwitching && isPrimary {
+                    ProgressView().tint(.white)
                 }
 
                 if let focusPoint {
@@ -83,16 +88,17 @@ struct FormatTile: View {
                 }
             }
             .contentShape(Rectangle())
-            .onTapGesture { location in
-                guard !compact, enabled else { return }
-                let point = CGPoint(x: location.x / geo.size.width, y: location.y / geo.size.height)
+            // Compact windows leave taps to their parent (swap); full tiles tap to focus.
+            .gesture(SpatialTapGesture().onEnded { value in
+                guard enabled else { return }
+                let point = CGPoint(x: value.location.x / geo.size.width, y: value.location.y / geo.size.height)
                 model.focus(at: point, in: kind)
                 withAnimation(.easeOut(duration: 0.15)) { focusPoint = point }
                 Task {
                     try? await Task.sleep(nanoseconds: 1_200_000_000)
                     withAnimation { if focusPoint == point { focusPoint = nil } }
                 }
-            }
+            }, including: compact ? .none : .all)
         }
         .aspectRatio(kind.uprightAspect, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: compact ? 10 : 16, style: .continuous))
@@ -123,26 +129,20 @@ struct FocusSquare: View {
     }
 }
 
-/// The live preview area: both formats side by side, or one big with the other floating.
+/// The live preview area: both formats stacked, or one big with the other in a corner window.
 struct PreviewStage: View {
     @ObservedObject var model: CameraModel
     @ObservedObject var motion: LevelMotion
-    @State private var pipOffset: CGSize = .zero
-    @State private var dragOffset: CGSize = .zero
     @State private var pinchStart: CGFloat?
 
-    private var shownKinds: [OutputKind] {
-        let pair: [OutputKind] = [.vertical, .horizontal]
-        let enabledPair = pair.filter(model.config.isEnabled)
-        if enabledPair.isEmpty { return model.config.isEnabled(.full) ? [.full] : pair }
-        if model.isFront { return pair }
-        return pair
+    private var onlyFull: Bool {
+        !model.config.isEnabled(.vertical) && !model.config.isEnabled(.horizontal) && model.config.isEnabled(.full)
     }
 
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                if shownKinds == [.full] {
+                if onlyFull {
                     FormatTile(kind: .full, model: model, motion: motion)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if model.config.layout == .split {
@@ -150,14 +150,14 @@ struct PreviewStage: View {
                 } else {
                     pip(in: geo.size)
                 }
-                overlayHUD
+                PreviewHUD(model: model, meters: model.meters)
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
         .gesture(
             MagnificationGesture()
                 .onChanged { scale in
-                    if pinchStart == nil { pinchStart = model.zoomDisplay }
+                    if pinchStart == nil { pinchStart = model.readouts.zoomDisplay }
                     let range = model.zoomRange
                     let value = min(max((pinchStart ?? 1) * scale, range.lowerBound), range.upperBound)
                     model.setZoom(display: value)
@@ -181,10 +181,15 @@ struct PreviewStage: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    /// The secondary format sits in a fixed spot at the bottom; its button makes it bigger or smaller.
+    /// Tapping the window swaps which format is the big one.
     private func pip(in size: CGSize) -> some View {
         let primary = model.config.pipPrimary == .horizontal ? OutputKind.horizontal : OutputKind.vertical
         let secondary: OutputKind = primary == .vertical ? .horizontal : .vertical
-        let smallWidth: CGFloat = secondary == .horizontal ? size.width * 0.42 : size.width * 0.26
+        let large = model.config.pipLarge
+        let smallWidth: CGFloat = secondary == .horizontal
+            ? size.width * (large ? 0.72 : 0.42)
+            : size.width * (large ? 0.42 : 0.24)
         return ZStack(alignment: .bottom) {
             FormatTile(kind: primary, model: model, motion: motion)
                 .frame(maxWidth: size.width - 16, maxHeight: size.height)
@@ -192,63 +197,73 @@ struct PreviewStage: View {
 
             FormatTile(kind: secondary, model: model, motion: motion, isPrimary: false, compact: true)
                 .frame(width: smallWidth)
+                .onTapGesture {
+                    withAnimation(.spring(duration: 0.35)) { model.config.pipPrimary = secondary }
+                }
                 .overlay(alignment: .bottomTrailing) {
-                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: 10, weight: .bold))
-                        .padding(5)
-                        .background(.black.opacity(0.5), in: Circle())
-                        .foregroundStyle(.white)
-                        .padding(5)
+                    Button {
+                        withAnimation(.spring(duration: 0.3)) { model.config.pipLarge.toggle() }
+                    } label: {
+                        Image(systemName: large ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 30, height: 30)
+                            .background(.black.opacity(0.55), in: Circle())
+                            .contentShape(Circle())
+                    }
+                    .padding(4)
+                    .accessibilityLabel(large ? "Diminuir janela" : "Aumentar janela")
                 }
                 .shadow(color: .black.opacity(0.5), radius: 10, y: 4)
-                .offset(x: pipOffset.width + dragOffset.width, y: pipOffset.height + dragOffset.height)
-                .padding(.bottom, 24)
-                .onTapGesture {
-                    withAnimation(.spring(duration: 0.35)) {
-                        model.config.pipPrimary = secondary
-                    }
-                }
-                .gesture(
-                    DragGesture()
-                        .onChanged { dragOffset = $0.translation }
-                        .onEnded { value in
-                            pipOffset.width += value.translation.width
-                            pipOffset.height += value.translation.height
-                            dragOffset = .zero
-                        }
-                )
+                .padding(.bottom, 20)
         }
     }
+}
 
-    private var overlayHUD: some View {
+/// Histogram, audio meter and recording / long-exposure badge. Observes only the fast meters.
+private struct PreviewHUD: View {
+    @ObservedObject var model: CameraModel
+    @ObservedObject var meters: LiveMeters
+
+    var body: some View {
         VStack {
             HStack(alignment: .top) {
-                if model.config.showHistogram { HistogramView(values: model.histogram) }
+                if model.config.showHistogram { HistogramView(values: meters.histogram) }
                 Spacer()
             }
-            .overlay(alignment: .top) {
-                if model.isRecording || (model.isBusy && model.config.mode == .video) { recordingBadge }
-            }
+            .overlay(alignment: .top) { badge }
             Spacer()
         }
         .padding(.horizontal, 16)
         .padding(.top, 6)
         .overlay(alignment: .trailing) {
             if model.config.audioMeter && model.config.mode == .video {
-                AudioMeter(level: model.audioLevel).padding(.trailing, 4)
+                AudioMeter(level: meters.audioLevel).padding(.trailing, 4)
             }
         }
         .allowsHitTesting(false)
     }
 
-    private var recordingBadge: some View {
-        HStack(spacing: 6) {
-            Circle().fill(model.isBusy ? Color.orange : Color.red).frame(width: 8, height: 8)
-            Text(model.isBusy ? "Salvando…" : formatDuration(model.elapsed))
-                .font(.system(size: 14, weight: .semibold).monospacedDigit())
+    @ViewBuilder private var badge: some View {
+        if let progress = model.stackProgress {
+            HStack(spacing: 8) {
+                ProgressView(value: progress).progressViewStyle(.circular).tint(.accentTeal)
+                Text(progress <= 0 ? "Estabilizando exposição…"
+                     : "Expondo \(Int(Double(model.config.longExposureSeconds) * (1 - progress)))s · não mexa no celular")
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(.black.opacity(0.6), in: Capsule())
+        } else if model.isRecording || (model.isBusy && model.config.mode == .video) {
+            HStack(spacing: 6) {
+                Circle().fill(model.isBusy ? Color.orange : Color.red).frame(width: 8, height: 8)
+                Text(model.isBusy ? "Salvando…" : formatDuration(model.elapsed))
+                    .font(.system(size: 14, weight: .semibold).monospacedDigit())
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(.black.opacity(0.6), in: Capsule())
         }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 12).padding(.vertical, 6)
-        .background(.black.opacity(0.6), in: Capsule())
     }
 }

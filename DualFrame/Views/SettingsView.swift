@@ -2,6 +2,8 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var model: CameraModel
+    /// Not observed here: only the small row below redraws when readouts change.
+    let readouts: DeviceReadouts
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -24,11 +26,10 @@ struct SettingsView: View {
                 Section("Gravação") {
                     toggle("Salvar em Fotos", "Cada gravação também é copiada para o app Fotos.",
                            isOn: $model.config.saveToPhotos)
-                    picker("Estabilização", "Reduz a tremida ao filmar na mão. Padrão é a mais fluida na prévia.",
+                    picker("Estabilização", "O app escolhe o formato do sensor que suporta o modo pedido. Cinemática e Máxima seguram mais, com um leve atraso na prévia.",
                            selection: $model.config.stabilization, options: StabilizationChoice.allCases) { $0.label }
-                    toggle("Vídeo HDR", model.config.hdr ? "Grava em HLG 10-bit. Arquivos maiores."
-                                                         : "Grava em SDR. Arquivos menores, mais fáceis de editar.",
-                           isOn: $model.config.hdr)
+                    picker("Cor do vídeo", rangeSubtitle,
+                           selection: $model.config.dynamicRange, options: DynamicRange.allCases) { $0.label }
                     picker("Codec", "HEVC é o melhor equilíbrio entre qualidade e tamanho.",
                            selection: $model.config.codec, options: VideoCodecChoice.allCases) { $0.label }
                     picker("Qualidade", "Taxa de bits do vídeo.",
@@ -68,7 +69,8 @@ struct SettingsView: View {
 
                 Section("Sobre") {
                     LabeledContent("Câmera ativa", value: model.state.device?.localizedName ?? "—")
-                    LabeledContent("Estabilização ativa", value: model.state.stabilizationActive)
+                    LabeledContent("Estabilização pedida", value: model.state.stabilizationRequested)
+                    ActiveStabilizationRow(readouts: readouts)
                     LabeledContent("Versão", value: appVersion)
                     ForEach(model.state.notes, id: \.self) { note in
                         Label(note, systemImage: "info.circle")
@@ -89,6 +91,16 @@ struct SettingsView: View {
         .tint(.accentTeal)
         .preferredColorScheme(.dark)
         .presentationDragIndicator(.visible)
+    }
+
+    private var rangeSubtitle: String {
+        switch model.config.dynamicRange {
+        case .sdr: return "SDR: arquivos menores, prontos para postar."
+        case .hdr: return "HDR HLG 10-bit: mais alcance de luz, arquivos maiores."
+        case .log: return model.state.appleLogAvailable
+            ? "Apple Log 10-bit: imagem plana para colorir na edição."
+            : "Apple Log só existe no iPhone 15 Pro ou mais novo; aqui grava HLG 10-bit, o perfil mais plano disponível."
+        }
     }
 
     private var appVersion: String {
@@ -138,5 +150,13 @@ struct SettingsView: View {
             }
         }
         .pickerStyle(.menu)
+    }
+}
+
+private struct ActiveStabilizationRow: View {
+    @ObservedObject var readouts: DeviceReadouts
+
+    var body: some View {
+        LabeledContent("Estabilização ativa agora", value: readouts.activeStabilization)
     }
 }

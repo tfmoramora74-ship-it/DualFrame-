@@ -4,16 +4,15 @@ import ImageIO
 import Metal
 
 /// GPU crop / rotate / scale of sensor frames for the recorded files, the live previews and photos.
-/// One shared CIContext; only ever used from the capture output queue (and the photo queue for encoding).
+/// One shared CIContext, used from the capture output queue and the photo queue.
 final class FrameRenderer: @unchecked Sendable {
     let context: CIContext
     private var pools: [String: CVPixelBufferPool] = [:]
     private let poolLock = NSLock()
 
-    static let sdrVideoSpace = CGColorSpace(name: CGColorSpace.itur_709)!
-    static let hdrVideoSpace = CGColorSpace(name: CGColorSpace.itur_2100_HLG)!
     static let displaySpace = CGColorSpace(name: CGColorSpace.sRGB)!
     static let photoSpace = CGColorSpace(name: CGColorSpace.displayP3)!
+    static let linearSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
 
     init() {
         let options: [CIContextOption: Any] = [.cacheIntermediates: false, .workingFormat: CIFormat.RGBAh]
@@ -24,13 +23,21 @@ final class FrameRenderer: @unchecked Sendable {
         }
     }
 
-    /// Cuts `crop` (buffer pixels, top-left origin) out of `source`, turns it upright by `rotation`
+    /// Source image of a capture buffer. `colorManaged == false` passes the encoded values straight
+    /// through (exact for SDR, HLG and Log files: no transfer-function round trip).
+    static func source(_ buffer: CVPixelBuffer, colorManaged: Bool) -> CIImage {
+        colorManaged
+            ? CIImage(cvPixelBuffer: buffer)
+            : CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
+    }
+
+    /// Cuts `crop` (pixels, top-left origin) out of `image`, turns it upright by `rotation`
     /// degrees, optionally mirrors it, and scales it to exactly `size`.
-    func image(from source: CVPixelBuffer, crop: CGRect, rotation: Int, mirror: Bool = false,
-               size: CGSize) -> CIImage {
-        let height = CGFloat(CVPixelBufferGetHeight(source))
-        let ciCrop = CGRect(x: crop.minX, y: height - crop.maxY, width: crop.width, height: crop.height)
-        var image = CIImage(cvPixelBuffer: source).cropped(to: ciCrop)
+    func image(from source: CIImage, crop: CGRect, rotation: Int, mirror: Bool = false, size: CGSize) -> CIImage {
+        let height = source.extent.height
+        let ciCrop = CGRect(x: source.extent.minX + crop.minX, y: source.extent.minY + height - crop.maxY,
+                            width: crop.width, height: crop.height)
+        var image = source.cropped(to: ciCrop)
         image = image.transformed(by: CGAffineTransform(translationX: -ciCrop.minX, y: -ciCrop.minY))
         if let orientation = Self.orientation(for: rotation) {
             image = image.oriented(orientation)
@@ -41,15 +48,23 @@ final class FrameRenderer: @unchecked Sendable {
                 .translatedBy(x: -image.extent.width, y: 0))
         }
         let extent = image.extent
+        guard extent.width != size.width || extent.height != size.height else { return image }
         let scaleX = size.width / extent.width, scaleY = size.height / extent.height
         return image.clampedToExtent()
             .transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
             .cropped(to: CGRect(origin: .zero, size: size))
     }
 
-    /// Renders into a pooled buffer of the given pixel format. Colour tags are copied from
-    /// `source`, minus any clean-aperture / pixel-aspect metadata that would distort playback.
-    func render(_ image: CIImage, size: CGSize, format: OSType, colorSpace: CGColorSpace,
+    func image(from buffer: CVPixelBuffer, crop: CGRect, rotation: Int, mirror: Bool = false, size: CGSize,
+               colorManaged: Bool = true) -> CIImage {
+        image(from: Self.source(buffer, colorManaged: colorManaged), crop: crop, rotation: rotation,
+              mirror: mirror, size: size)
+    }
+
+    /// Renders into a pooled buffer. Colour tags are copied from `source`, minus any
+    /// clean-aperture / pixel-aspect metadata that would distort playback.
+    /// A nil `colorSpace` writes the values unconverted (pair with `colorManaged: false` sources).
+    func render(_ image: CIImage, size: CGSize, format: OSType, colorSpace: CGColorSpace?,
                 tagsFrom source: CVPixelBuffer?) -> CVPixelBuffer? {
         guard let pool = pool(width: Int(size.width), height: Int(size.height), format: format) else { return nil }
         var output: CVPixelBuffer?
@@ -66,7 +81,7 @@ final class FrameRenderer: @unchecked Sendable {
 
     func writeHEIC(_ image: CIImage, to url: URL) throws {
         try context.writeHEIFRepresentation(of: image, to: url, format: .RGBA8, colorSpace: Self.photoSpace,
-                                            options: [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.9])
+                                            options: [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.92])
     }
 
     static func orientation(for rotation: Int) -> CGImagePropertyOrientation? {
@@ -95,6 +110,68 @@ final class FrameRenderer: @unchecked Sendable {
         CVPixelBufferPoolCreate(kCFAllocatorDefault, poolAttributes as CFDictionary, attributes as CFDictionary, &pool)
         pools[key] = pool
         return pool
+    }
+}
+
+/// Accumulates frames into a half-float buffer pair (ping-pong) for long exposures.
+final class FrameStacker {
+    let blend: StackBlend
+    private let renderer: FrameRenderer
+    private var buffers: [CVPixelBuffer] = []
+    private var current = 0
+    private(set) var count = 0
+    let width: Int
+    let height: Int
+
+    init?(renderer: FrameRenderer, width: Int, height: Int, blend: StackBlend) {
+        self.renderer = renderer
+        self.width = width
+        self.height = height
+        self.blend = blend
+        let attributes: [String: Any] = [kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+                                         kCVPixelBufferMetalCompatibilityKey as String: true]
+        for _ in 0..<2 {
+            var buffer: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_64RGBAHalf,
+                                attributes as CFDictionary, &buffer)
+            guard let buffer else { return nil }
+            buffers.append(buffer)
+        }
+    }
+
+    private var accumulated: CIImage {
+        CIImage(cvPixelBuffer: buffers[current], options: [.colorSpace: FrameRenderer.linearSpace])
+    }
+
+    func add(_ frame: CVPixelBuffer) {
+        let image = CIImage(cvPixelBuffer: frame)
+        let combined: CIImage
+        if count == 0 {
+            combined = image
+        } else if blend == .average {
+            combined = image.applyingFilter("CIAdditionCompositing", parameters: [kCIInputBackgroundImageKey: accumulated])
+        } else {
+            combined = image.applyingFilter("CILightenBlendMode", parameters: [kCIInputBackgroundImageKey: accumulated])
+        }
+        let target = 1 - current
+        renderer.context.render(combined, to: buffers[target],
+                                bounds: CGRect(x: 0, y: 0, width: width, height: height),
+                                colorSpace: FrameRenderer.linearSpace)
+        current = target
+        count += 1
+    }
+
+    /// The final image (averaged when blending by mean).
+    func result() -> CIImage {
+        let image = accumulated
+        guard blend == .average, count > 1 else { return image }
+        let k = CGFloat(1) / CGFloat(count)
+        return image.applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: k, y: 0, z: 0, w: 0),
+            "inputGVector": CIVector(x: 0, y: k, z: 0, w: 0),
+            "inputBVector": CIVector(x: 0, y: 0, z: k, w: 0),
+            "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1),
+        ])
     }
 }
 

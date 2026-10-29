@@ -15,14 +15,14 @@ struct Take: Identifiable, Hashable {
 @MainActor
 final class TakeStore: ObservableObject {
     static let didChange = Notification.Name("TakeStore.didChange")
-    nonisolated static let mediaExtensions: Set<String> = ["mov", "mp4", "heic", "jpg"]
+    nonisolated static let mediaExtensions: Set<String> = ["mov", "mp4", "heic", "jpg", "dng"]
 
     nonisolated static var root: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("Takes")
     }
 
     nonisolated static func isPhoto(_ url: URL) -> Bool {
-        ["heic", "jpg"].contains(url.pathExtension.lowercased())
+        ["heic", "jpg", "dng"].contains(url.pathExtension.lowercased())
     }
 
     @Published private(set) var takes: [Take] = []
@@ -47,6 +47,7 @@ final class TakeStore: ObservableObject {
         let name = url.deletingPathExtension().lastPathComponent
         if name.hasSuffix("_Vertical") { return 0 }
         if name.hasSuffix("_Horizontal") { return 1 }
+        if name.hasSuffix("_RAW") { return 3 }
         return 2
     }
 
@@ -90,6 +91,7 @@ final class TakeStore: ObservableObject {
         if name.hasSuffix("_Vertical") { return "9:16" }
         if name.hasSuffix("_Horizontal") { return "16:9" }
         if name.hasSuffix("_Sensor") { return "4:3" }
+        if name.hasSuffix("_RAW") { return "RAW" }
         return name
     }
 }
@@ -110,7 +112,7 @@ enum Thumbnailer {
         if TakeStore.isPhoto(url) {
             guard let image = UIImage(contentsOfFile: url.path) else { return "" }
             let pixels = CGSize(width: image.size.width * image.scale, height: image.size.height * image.scale)
-            return "\(Int(pixels.width))×\(Int(pixels.height)) · HEIC"
+            return "\(Int(pixels.width))×\(Int(pixels.height)) · \(url.pathExtension.uppercased())"
         }
         let asset = AVURLAsset(url: url)
         guard let track = try? await asset.loadTracks(withMediaType: .video).first,

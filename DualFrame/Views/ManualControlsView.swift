@@ -3,6 +3,7 @@ import SwiftUI
 /// Row of pro-control chips; the selected one opens a slider with an Auto button.
 struct ManualControlsView: View {
     @ObservedObject var model: CameraModel
+    @ObservedObject var readouts: DeviceReadouts
     @Binding var selected: ManualControl?
 
     var body: some View {
@@ -36,7 +37,7 @@ struct ManualControlsView: View {
         case .iso, .shutter: return model.manualExposure
         case .whiteBalance: return model.manualWB
         case .focus: return model.manualFocus
-        case .exposureBias: return abs(model.exposureBias) > 0.05
+        case .exposureBias: return abs(readouts.exposureBias) > 0.05
         }
     }
 
@@ -62,11 +63,11 @@ struct ManualControlsView: View {
 
     private func value(_ control: ManualControl) -> String {
         switch control {
-        case .iso: return "\(Int(model.iso))"
-        case .shutter: return formatShutter(model.shutter)
-        case .whiteBalance: return "\(Int(model.temperature / 100) * 100)K"
-        case .focus: return String(format: "%.2f", model.lensPosition)
-        case .exposureBias: return String(format: "%+.1f", model.exposureBias)
+        case .iso: return "\(Int(readouts.iso))"
+        case .shutter: return formatShutter(readouts.shutter)
+        case .whiteBalance: return "\(Int(readouts.temperature / 100) * 100)K"
+        case .focus: return String(format: "%.2f", readouts.lensPosition)
+        case .exposureBias: return String(format: "%+.1f", readouts.exposureBias)
         }
     }
 
@@ -74,8 +75,8 @@ struct ManualControlsView: View {
     private func panel(for control: ManualControl) -> some View {
         switch control {
         case .iso:
-            SliderPanel(title: "ISO \(Int(model.iso))",
-                        value: Double(model.iso),
+            SliderPanel(title: "ISO \(Int(readouts.iso))",
+                        value: Double(readouts.iso),
                         range: Double(model.isoRange.lowerBound)...Double(model.isoRange.upperBound),
                         logarithmic: true,
                         unsupported: model.supportsManualExposure ? nil : "Esta lente não permite ISO manual.",
@@ -83,8 +84,8 @@ struct ManualControlsView: View {
                         onChange: { model.setISO(Float($0)) },
                         onAuto: { model.setExposureAuto() })
         case .shutter:
-            SliderPanel(title: "Obturador \(formatShutter(model.shutter))",
-                        value: model.shutter,
+            SliderPanel(title: "Obturador \(formatShutter(readouts.shutter))",
+                        value: readouts.shutter,
                         range: model.shutterRange,
                         logarithmic: true,
                         unsupported: model.supportsManualExposure ? nil : "Esta lente não permite obturador manual.",
@@ -92,8 +93,8 @@ struct ManualControlsView: View {
                         onChange: { model.setShutter($0) },
                         onAuto: { model.setExposureAuto() })
         case .whiteBalance:
-            SliderPanel(title: "Balanço de branco \(Int(model.temperature))K",
-                        value: Double(model.temperature),
+            SliderPanel(title: "Balanço de branco \(Int(readouts.temperature))K",
+                        value: Double(readouts.temperature),
                         range: 2500...9000,
                         logarithmic: false,
                         unsupported: model.supportsManualWB ? nil : "Esta lente não permite balanço de branco manual.",
@@ -101,8 +102,8 @@ struct ManualControlsView: View {
                         onChange: { model.setWhiteBalance(temperature: Float($0)) },
                         onAuto: { model.setWhiteBalanceAuto() })
         case .focus:
-            SliderPanel(title: "Foco \(String(format: "%.2f", model.lensPosition))  ·  perto ← → infinito",
-                        value: Double(model.lensPosition),
+            SliderPanel(title: "Foco \(String(format: "%.2f", readouts.lensPosition))  ·  perto ← → infinito",
+                        value: Double(readouts.lensPosition),
                         range: 0...1,
                         logarithmic: false,
                         unsupported: model.supportsManualFocus ? nil : "Esta lente não tem foco manual (foco fixo).",
@@ -110,12 +111,12 @@ struct ManualControlsView: View {
                         onChange: { model.setFocus(Float($0)) },
                         onAuto: { model.setFocusAuto() })
         case .exposureBias:
-            SliderPanel(title: "Exposição \(String(format: "%+.1f", model.exposureBias)) EV",
-                        value: Double(model.exposureBias),
+            SliderPanel(title: "Exposição \(String(format: "%+.1f", readouts.exposureBias)) EV",
+                        value: Double(readouts.exposureBias),
                         range: Double(model.biasRange.lowerBound)...Double(model.biasRange.upperBound),
                         logarithmic: false,
                         unsupported: nil,
-                        isAuto: abs(model.exposureBias) < 0.05,
+                        isAuto: abs(readouts.exposureBias) < 0.05,
                         onChange: { model.setExposureBias(Float(($0 * 10).rounded() / 10)) },
                         onAuto: { model.setExposureBias(0) })
         }

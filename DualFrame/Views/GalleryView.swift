@@ -105,12 +105,15 @@ struct TakeDetailView: View {
             Group {
                 if let selection, TakeStore.isPhoto(selection) {
                     if let image {
-                        Image(uiImage: image).resizable().scaledToFit()
+                        ZoomableMedia(content: .image(image))
                     } else {
                         ProgressView()
                     }
                 } else {
-                    VideoPlayer(player: player)
+                    VStack(spacing: 8) {
+                        ZoomableMedia(content: .video(player))
+                        PlayerControls(player: player)
+                    }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -157,6 +160,7 @@ struct TakeDetailView: View {
             guard let selection else { return }
             if TakeStore.isPhoto(selection) {
                 player.pause()
+                image = nil
                 image = UIImage(contentsOfFile: selection.path)
             } else {
                 player.replaceCurrentItem(with: AVPlayerItem(url: selection))

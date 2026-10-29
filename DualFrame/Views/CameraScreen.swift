@@ -24,10 +24,14 @@ struct CameraScreen: View {
                     topBar
                     PreviewStage(model: model, motion: motion)
                         .padding(.top, 8)
-                    lensRow
+                    LensRow(model: model, readouts: model.readouts)
                         .padding(.top, 10)
+                    if model.config.mode == .longExposure {
+                        LongExposurePanel(model: model)
+                            .padding(.top, 10)
+                    }
                     if showPro {
-                        ManualControlsView(model: model, selected: $proControl)
+                        ManualControlsView(model: model, readouts: model.readouts, selected: $proControl)
                             .padding(.top, 10)
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
@@ -61,12 +65,13 @@ struct CameraScreen: View {
                         .font(.system(size: 14, weight: .medium))
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 16).padding(.vertical, 10)
-                        .background(.ultraThinMaterial, in: Capsule())
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .padding(.horizontal, 24)
                         .padding(.bottom, 210)
                 }
                 .transition(.opacity)
                 .task(id: toast) {
-                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    try? await Task.sleep(nanoseconds: 3_500_000_000)
                     withAnimation { model.toast = nil }
                 }
             }
@@ -74,6 +79,7 @@ struct CameraScreen: View {
         .preferredColorScheme(.dark)
         .tint(.accentTeal)
         .animation(.easeOut(duration: 0.2), value: showPro)
+        .animation(.easeOut(duration: 0.2), value: model.config.mode)
         .task {
             await model.start()
             motion.start()
@@ -90,7 +96,7 @@ struct CameraScreen: View {
             withAnimation(.easeOut(duration: 0.35)) { flashOpacity = 0 }
         }
         .sheet(isPresented: $showSettings) {
-            SettingsView(model: model)
+            SettingsView(model: model, readouts: model.readouts)
         }
         .fullScreenCover(isPresented: $showGallery) {
             GalleryView(store: store)
@@ -106,9 +112,14 @@ struct CameraScreen: View {
                 withAnimation(.easeOut(duration: 0.2)) { showFormatPanel.toggle() }
             } label: {
                 HStack(spacing: 12) {
-                    chipValue(model.config.mode == .photo ? "FOTO" : primaryResolutionLabel, sub: "RES")
-                    if model.config.mode == .video {
-                        chipValue("\(Int(model.state.fps))", sub: model.state.hdrActive ? "HDR" : "FPS")
+                    switch model.config.mode {
+                    case .video:
+                        chipValue(primaryResolutionLabel, sub: "RES")
+                        chipValue("\(Int(model.state.fps))", sub: rangeBadge)
+                    case .photo:
+                        chipValue("FOTO", sub: model.config.rawPhoto ? "RAW" : "HEIC")
+                    case .longExposure:
+                        chipValue("\(model.config.longExposureSeconds)s", sub: "EXP")
                     }
                     Image(systemName: "slider.horizontal.3")
                         .font(.system(size: 17, weight: .medium))
@@ -135,7 +146,7 @@ struct CameraScreen: View {
                 toolbarIcon("arrow.triangle.2.circlepath.camera", active: false, label: "Virar câmera") {
                     model.flipCamera()
                 }
-                .disabled(model.isRecording)
+                .disabled(model.isRecording || model.isSwitching)
                 toolbarIcon("gearshape.fill", active: false, label: "Ajustes") { showSettings = true }
                     .disabled(model.isRecording)
             }
@@ -147,9 +158,16 @@ struct CameraScreen: View {
         .padding(.top, 4)
     }
 
+    private var rangeBadge: String {
+        switch model.state.dynamicRange {
+        case .sdr: return "FPS"
+        case .hdr: return "HDR"
+        case .log: return "LOG"
+        }
+    }
+
     private var primaryResolutionLabel: String {
-        let kinds = model.config.outputs
-        let labels = Set(kinds.map { model.config.resolution(for: $0).label })
+        let labels = Set(model.config.outputs.map { model.config.resolution(for: $0).label })
         if labels.count == 1, let only = labels.first { return only }
         return labels.contains("4K") ? "4K" : (labels.contains("Nativa") ? "MAX" : "HD")
     }
@@ -172,33 +190,6 @@ struct CameraScreen: View {
         .accessibilityLabel(label)
     }
 
-    // MARK: Lens row
-
-    private var lensRow: some View {
-        HStack(spacing: 6) {
-            ForEach(model.lensButtons) { button in
-                let active = model.isActive(button)
-                Button {
-                    model.select(button)
-                } label: {
-                    Text(active ? zoomLabel(model.zoomDisplay) : button.label)
-                        .font(.system(size: active ? 13 : 12, weight: .bold))
-                        .foregroundStyle(active ? Color.accentTeal : Color.white)
-                        .frame(width: active ? 42 : 36, height: active ? 42 : 36)
-                        .background(Color.black.opacity(active ? 0.7 : 0.35), in: Circle())
-                }
-                .accessibilityLabel("Zoom \(button.label)")
-            }
-        }
-        .animation(.spring(duration: 0.25), value: model.zoomDisplay)
-    }
-
-    private func zoomLabel(_ value: CGFloat) -> String {
-        if value < 1 { return String(format: ",%d×", Int((value * 10).rounded())) }
-        let rounded = (value * 10).rounded() / 10
-        return rounded == rounded.rounded() ? "\(Int(rounded))×" : String(format: "%.1f×", rounded)
-    }
-
     // MARK: Shutter row
 
     private var shutterRow: some View {
@@ -218,14 +209,16 @@ struct CameraScreen: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.white.opacity(0.25)))
             }
-            .disabled(model.isRecording)
+            .disabled(model.isRecording || model.stackProgress != nil)
             .accessibilityLabel("Gravações")
 
             Spacer()
 
-            ShutterButton(mode: model.config.mode, isRecording: model.isRecording, isBusy: model.isBusy) {
+            ShutterButton(mode: model.config.mode, isRecording: model.isRecording,
+                          isBusy: model.isBusy, stackProgress: model.stackProgress) {
                 model.shutterPressed()
             }
+            .disabled(model.isSwitching)
 
             Spacer()
 
@@ -240,7 +233,7 @@ struct CameraScreen: View {
                     .frame(width: 52, height: 52)
                     .background(Color.black.opacity(0.4), in: Circle())
             }
-            .accessibilityLabel(model.config.layout == .split ? "Prévia em janela flutuante" : "Prévias separadas")
+            .accessibilityLabel(model.config.layout == .split ? "Uma prévia grande com janela" : "Prévias separadas")
         }
         .padding(.horizontal, 26)
     }
@@ -248,17 +241,17 @@ struct CameraScreen: View {
     // MARK: Mode picker
 
     private var modePicker: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 2) {
             ForEach(CaptureMode.allCases) { mode in
                 let selected = model.config.mode == mode
                 Button {
-                    guard !model.isRecording else { return }
-                    withAnimation(.spring(duration: 0.3)) { model.config.mode = mode }
+                    guard !model.isRecording, model.stackProgress == nil, !model.isSwitching else { return }
+                    model.config.mode = mode
                 } label: {
                     Text(mode.label)
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(selected ? Color.white : Color.white.opacity(0.75))
-                        .frame(width: 96, height: 38)
+                        .frame(width: 98, height: 38)
                         .background(selected ? Color.accentTeal : Color.clear, in: Capsule())
                 }
             }
@@ -283,32 +276,136 @@ struct CameraScreen: View {
     }
 }
 
+/// The round zoom buttons. Observes only the device readouts.
+private struct LensRow: View {
+    @ObservedObject var model: CameraModel
+    @ObservedObject var readouts: DeviceReadouts
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(model.lensButtons) { button in
+                let active = model.isActive(button, zoom: readouts.zoomDisplay)
+                Button {
+                    model.select(button)
+                } label: {
+                    Text(active ? zoomLabel(readouts.zoomDisplay) : button.label)
+                        .font(.system(size: active ? 13 : 12, weight: .bold))
+                        .foregroundStyle(active ? Color.accentTeal : Color.white)
+                        .frame(width: active ? 42 : 36, height: active ? 42 : 36)
+                        .background(Color.black.opacity(active ? 0.7 : 0.35), in: Circle())
+                }
+                .accessibilityLabel("Zoom \(button.label)")
+            }
+        }
+        .disabled(model.isSwitching)
+        .animation(.spring(duration: 0.25), value: readouts.zoomDisplay)
+    }
+
+    private func zoomLabel(_ value: CGFloat) -> String {
+        if value < 1 { return String(format: ",%d×", Int((value * 10).rounded())) }
+        return value == value.rounded() ? "\(Int(value))×" : String(format: "%.1f×", value)
+    }
+}
+
+/// Duration, blend and focus for long exposures.
+private struct LongExposurePanel: View {
+    @ObservedObject var model: CameraModel
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 6) {
+                ForEach([2, 5, 10, 20, 30, 60], id: \.self) { seconds in
+                    let selected = model.config.longExposureSeconds == seconds
+                    Button { model.config.longExposureSeconds = seconds } label: {
+                        Text("\(seconds)s")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(selected ? Color.black : Color.white)
+                            .frame(maxWidth: .infinity, minHeight: 32)
+                            .background(selected ? Color.accentTeal : Color.black.opacity(0.45), in: Capsule())
+                    }
+                }
+            }
+            HStack(spacing: 6) {
+                ForEach(StackBlend.allCases) { blend in
+                    let selected = model.config.longExposureBlend == blend
+                    Button { model.config.longExposureBlend = blend } label: {
+                        Text(blend.label)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(selected ? Color.black : Color.white)
+                            .frame(maxWidth: .infinity, minHeight: 32)
+                            .background(selected ? Color.accentTeal : Color.black.opacity(0.45), in: Capsule())
+                    }
+                }
+                Button { model.config.longExposureInfinityFocus.toggle() } label: {
+                    Label("∞", systemImage: model.config.longExposureInfinityFocus ? "checkmark" : "xmark")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(model.config.longExposureInfinityFocus ? Color.black : Color.white)
+                        .frame(width: 64, height: 32)
+                        .background(model.config.longExposureInfinityFocus ? Color.accentTeal : Color.black.opacity(0.45),
+                                    in: Capsule())
+                }
+                .accessibilityLabel("Foco no infinito")
+            }
+            Text("Apoie o celular (tripé). Cada quadro expõe até 1 s e todos são empilhados para reduzir o ruído.")
+                .font(.system(size: 11))
+                .foregroundStyle(.white.opacity(0.55))
+                .multilineTextAlignment(.center)
+        }
+        .padding(.horizontal, 16)
+        .disabled(model.stackProgress != nil)
+    }
+}
+
 struct ShutterButton: View {
     let mode: CaptureMode
     let isRecording: Bool
     let isBusy: Bool
+    let stackProgress: Double?
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             ZStack {
                 Circle()
-                    .strokeBorder(mode == .video ? Color.accentTeal : Color.white, lineWidth: 5)
+                    .strokeBorder(mode == .video ? Color.accentTeal : Color.white.opacity(0.9), lineWidth: 5)
                     .frame(width: 84, height: 84)
-                if mode == .photo {
+                switch mode {
+                case .photo:
                     Circle().fill(Color.white).frame(width: 66, height: 66)
                         .scaleEffect(isBusy ? 0.85 : 1)
-                } else {
+                case .video:
                     RoundedRectangle(cornerRadius: isRecording ? 8 : 33, style: .continuous)
                         .fill(isBusy ? Color.gray : Color.red)
                         .frame(width: isRecording ? 32 : 66, height: isRecording ? 32 : 66)
+                case .longExposure:
+                    if let stackProgress {
+                        Circle()
+                            .trim(from: 0, to: stackProgress)
+                            .stroke(Color.accentTeal, style: StrokeStyle(lineWidth: 5, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                            .frame(width: 84, height: 84)
+                        RoundedRectangle(cornerRadius: 6).fill(Color.white).frame(width: 26, height: 26)
+                    } else {
+                        Circle().fill(Color.white).frame(width: 66, height: 66)
+                        Image(systemName: "moon.stars.fill")
+                            .font(.system(size: 24))
+                            .foregroundStyle(.black)
+                    }
                 }
             }
             .animation(.spring(duration: 0.25), value: isRecording)
             .animation(.spring(duration: 0.15), value: isBusy)
         }
-        .disabled(isBusy && !isRecording)
-        .accessibilityLabel(mode == .photo ? "Tirar foto" : (isRecording ? "Parar gravação" : "Gravar"))
+        .disabled(isBusy && !isRecording && stackProgress == nil)
+        .accessibilityLabel(label)
+    }
+
+    private var label: String {
+        switch mode {
+        case .photo: return "Tirar foto"
+        case .video: return isRecording ? "Parar gravação" : "Gravar"
+        case .longExposure: return stackProgress == nil ? "Iniciar longa exposição" : "Cancelar longa exposição"
+        }
     }
 }
 
@@ -340,7 +437,7 @@ struct ShutterButtonInteraction: UIViewRepresentable {
     }
 }
 
-/// Drop-down panel under the resolution chip: per-format resolution, frame rate and HDR.
+/// Drop-down panel under the resolution chip.
 struct FormatPanel: View {
     @ObservedObject var model: CameraModel
 
@@ -349,34 +446,50 @@ struct FormatPanel: View {
             ForEach(OutputKind.allCases) { kind in
                 row(kind.menuTitle) {
                     let enabled = model.config.isEnabled(kind)
-                    let current = model.config.resolution(for: kind)
-                    ForEach(OutputResolution.allCases) { resolution in
-                        option(resolution.label, selected: enabled && current == resolution) {
-                            model.config.setResolution(resolution, for: kind)
-                            model.config.setEnabled(kind, true)
+                    if model.config.mode == .video {
+                        let current = model.config.resolution(for: kind)
+                        ForEach(OutputResolution.allCases) { resolution in
+                            option(resolution.label, selected: enabled && current == resolution) {
+                                model.config.setResolution(resolution, for: kind)
+                                model.config.setEnabled(kind, true)
+                            }
                         }
+                    } else {
+                        option("On", selected: enabled) { model.config.setEnabled(kind, true) }
                     }
                     option("Off", selected: !enabled) { model.config.setEnabled(kind, false) }
                 }
             }
-            if model.config.mode == .video {
-                Divider().overlay(Color.white.opacity(0.1))
+            Divider().overlay(Color.white.opacity(0.1))
+            switch model.config.mode {
+            case .video:
                 row("FRAME RATE") {
                     ForEach([24, 25, 30, 60], id: \.self) { fps in
                         option("\(fps)", selected: model.config.fps == fps) { model.config.fps = fps }
                     }
                 }
-                row("HDR") {
-                    option("SDR", selected: !model.config.hdr) { model.config.hdr = false }
-                    option("HLG 10-bit", selected: model.config.hdr) { model.config.hdr = true }
+                row("COR") {
+                    ForEach(DynamicRange.allCases) { range in
+                        option(range.label, selected: model.config.dynamicRange == range) {
+                            model.config.dynamicRange = range
+                        }
+                    }
                 }
+            case .photo:
+                row("RAW") {
+                    option("Off", selected: !model.config.rawPhoto) { model.config.rawPhoto = false }
+                    option("DNG", selected: model.config.rawPhoto) { model.config.rawPhoto = true }
+                }
+                Text("RAW salva um DNG do sensor inteiro, além dos recortes em HEIC.")
+                    .font(.system(size: 11)).foregroundStyle(.white.opacity(0.55))
+            case .longExposure:
+                Text("Duração e modo ficam logo acima do disparador.")
+                    .font(.system(size: 11)).foregroundStyle(.white.opacity(0.55))
             }
-            if !model.state.notes.isEmpty {
-                ForEach(model.state.notes, id: \.self) { note in
-                    Label(note, systemImage: "info.circle")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.white.opacity(0.6))
-                }
+            ForEach(model.state.notes, id: \.self) { note in
+                Label(note, systemImage: "info.circle")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.white.opacity(0.6))
             }
         }
         .padding(18)
@@ -403,7 +516,7 @@ struct FormatPanel: View {
                     .font(.system(size: 15, weight: selected ? .bold : .regular))
                     .foregroundStyle(selected ? Color.accentTeal : Color.white)
             }
-            .frame(minWidth: 52, minHeight: 32)
+            .frame(minWidth: 48, minHeight: 32)
         }
     }
 }

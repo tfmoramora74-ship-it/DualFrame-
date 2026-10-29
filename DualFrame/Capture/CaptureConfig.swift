@@ -69,9 +69,38 @@ enum OutputResolution: String, CaseIterable, Codable, Identifiable {
 }
 
 enum CaptureMode: String, Codable, CaseIterable, Identifiable {
-    case photo, video
+    case photo, video, longExposure
     var id: String { rawValue }
-    var label: String { self == .photo ? "Foto" : "Vídeo" }
+    var label: String {
+        switch self {
+        case .photo: return "Foto"
+        case .video: return "Vídeo"
+        case .longExposure: return "Longa exp."
+        }
+    }
+    var isStill: Bool { self != .video }
+}
+
+enum DynamicRange: String, Codable, CaseIterable, Identifiable {
+    case sdr, hdr, log
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .sdr: return "SDR"
+        case .hdr: return "HDR"
+        case .log: return "Log"
+        }
+    }
+}
+
+/// How long-exposure frames are combined.
+enum StackBlend: String, Codable, CaseIterable, Identifiable {
+    /// Mean of all frames: less noise, stars stay points (astro, night scenes).
+    case average
+    /// Brightest pixel wins: light and star trails.
+    case lighten
+    var id: String { rawValue }
+    var label: String { self == .average ? "Estrelas (média)" : "Rastros de luz" }
 }
 
 enum PreviewLayout: String, Codable {
@@ -114,7 +143,7 @@ enum BitrateQuality: String, CaseIterable, Codable, Identifiable {
 }
 
 enum StabilizationChoice: String, CaseIterable, Codable, Identifiable {
-    case off, standard, cinematic, cinematicExtended
+    case off, standard, cinematic, cinematicExtended, maximum
     var id: String { rawValue }
     var label: String {
         switch self {
@@ -122,6 +151,7 @@ enum StabilizationChoice: String, CaseIterable, Codable, Identifiable {
         case .standard: return "Padrão"
         case .cinematic: return "Cinemática"
         case .cinematicExtended: return "Cinemática estendida"
+        case .maximum: return "Máxima (iOS 18)"
         }
     }
 }
@@ -147,7 +177,11 @@ struct CaptureConfig: Codable, Equatable {
     var horizontalResolution: OutputResolution = .hd
     var fullResolution: OutputResolution = .native
     var fps: Int = 30
-    var hdr: Bool = false
+    var dynamicRange: DynamicRange = .sdr
+    var rawPhoto = false
+    var longExposureSeconds = 10
+    var longExposureBlend: StackBlend = .average
+    var longExposureInfinityFocus = true
     var codec: VideoCodecChoice = .hevc
     var quality: BitrateQuality = .high
     var stabilization: StabilizationChoice = .standard
@@ -159,6 +193,7 @@ struct CaptureConfig: Codable, Equatable {
 
     var layout: PreviewLayout = .split
     var pipPrimary: OutputKind = .vertical
+    var pipLarge = false
 
     var showGrid = false
     var showCrosshair = false
@@ -196,15 +231,15 @@ struct CaptureConfig: Codable, Equatable {
     /// 16:9 file's width is the sensor's *height*, so even HD wants the 4032×3024 format
     /// (1440 rows would be upscaled). Formats that can't reach the frame rate fall back to the largest that can.
     var requiredFormatWidth: Int {
-        mode == .photo ? Int.max : 3840
+        mode.isStill ? Int.max : 3840
     }
 
     /// Fields that require rebuilding the capture session when changed.
     var sessionKey: String {
-        "\(mode.rawValue)|\(lens.rawValue)|\(requiredFormatWidth)|\(fps)|\(hdr)|\(stabilization.rawValue)|\(formatOverride ?? "-")"
+        "\(mode.rawValue)|\(lens.rawValue)|\(requiredFormatWidth)|\(fps)|\(dynamicRange.rawValue)|\(rawPhoto)|\(stabilization.rawValue)|\(formatOverride ?? "-")"
     }
 
-    static let storageKey = "captureConfig.v2"
+    static let storageKey = "captureConfig.v3"
 
     static func load() -> CaptureConfig {
         guard let data = UserDefaults.standard.data(forKey: storageKey),
@@ -226,7 +261,7 @@ struct PendingTake {
     let codec: VideoCodecChoice
     let quality: BitrateQuality
     let fps: Double
-    let hdr: Bool
+    let dynamicRange: DynamicRange
     /// Degrees that turn the delivered buffer upright (0 when the buffer is already upright).
     let rotationDegrees: Double
     let mirror: Bool
@@ -238,8 +273,15 @@ struct PhotoRequest {
     let outputs: [OutputKind]
     let rotationDegrees: Double
     let mirror: Bool
+    let raw: Bool
     let folder: URL
     let baseName: String
+}
+
+struct LongExposureRequest {
+    let photo: PhotoRequest
+    let seconds: Double
+    let blend: StackBlend
 }
 
 struct TakeResult {
