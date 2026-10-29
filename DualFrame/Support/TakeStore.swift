@@ -7,15 +7,22 @@ struct Take: Identifiable, Hashable {
     let files: [URL]
     let date: Date
     let bytes: Int64
+
+    var isPhoto: Bool { files.allSatisfy(TakeStore.isPhoto) }
 }
 
 /// Takes live in Documents/Takes/<name>/, visible in the Files app.
 @MainActor
 final class TakeStore: ObservableObject {
     static let didChange = Notification.Name("TakeStore.didChange")
+    nonisolated static let mediaExtensions: Set<String> = ["mov", "mp4", "heic", "jpg"]
 
     nonisolated static var root: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("Takes")
+    }
+
+    nonisolated static func isPhoto(_ url: URL) -> Bool {
+        ["heic", "jpg"].contains(url.pathExtension.lowercased())
     }
 
     @Published private(set) var takes: [Take] = []
@@ -28,42 +35,70 @@ final class TakeStore: ObservableObject {
         reload()
     }
 
-    func reload() {
+    nonisolated static func files(in folder: URL) -> [URL] {
+        ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey],
+                                                        options: [.skipsHiddenFiles])) ?? [])
+            .filter { mediaExtensions.contains($0.pathExtension.lowercased()) }
+            .sorted { order($0) < order($1) }
+    }
+
+    /// Vertical, horizontal, sensor.
+    nonisolated private static func order(_ url: URL) -> Int {
+        let name = url.deletingPathExtension().lastPathComponent
+        if name.hasSuffix("_Vertical") { return 0 }
+        if name.hasSuffix("_Horizontal") { return 1 }
+        return 2
+    }
+
+    nonisolated static func folders() -> [(URL, Date)] {
         let fm = FileManager.default
-        try? fm.createDirectory(at: Self.root, withIntermediateDirectories: true)
-        let folders = (try? fm.contentsOfDirectory(at: Self.root, includingPropertiesForKeys: [.creationDateKey],
+        try? fm.createDirectory(at: root, withIntermediateDirectories: true)
+        let folders = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.creationDateKey],
                                                    options: [.skipsHiddenFiles])) ?? []
-        takes = folders.compactMap { folder -> Take? in
-            let files = ((try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey],
-                                                      options: [.skipsHiddenFiles])) ?? [])
-                .filter { ["mov", "mp4"].contains($0.pathExtension.lowercased()) }
-                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        return folders.map { folder in
+            (folder, (try? folder.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast)
+        }
+        .sorted { $0.1 > $1.1 }
+    }
+
+    nonisolated static func latestFile() -> URL? {
+        for (folder, _) in folders() {
+            if let first = files(in: folder).first { return first }
+        }
+        return nil
+    }
+
+    func reload() {
+        takes = Self.folders().compactMap { folder, date -> Take? in
+            let files = Self.files(in: folder)
             guard !files.isEmpty else { return nil }
-            let date = (try? folder.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
             let bytes = files.reduce(Int64(0)) { sum, url in
                 sum + Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
             }
             return Take(id: folder.lastPathComponent, folder: folder, files: files, date: date, bytes: bytes)
         }
-        .sorted { $0.date > $1.date }
     }
 
     func delete(_ take: Take) {
         try? FileManager.default.removeItem(at: take.folder)
         reload()
+        NotificationCenter.default.post(name: Self.didChange, object: nil)
     }
 
-    static func label(for url: URL) -> String {
+    nonisolated static func label(for url: URL) -> String {
         let name = url.deletingPathExtension().lastPathComponent
-        if name.hasSuffix("_Vertical") { return "Vertical 9:16" }
-        if name.hasSuffix("_Horizontal") { return "Horizontal 16:9" }
-        if name.hasSuffix("_Sensor") { return "Sensor 4:3" }
+        if name.hasSuffix("_Vertical") { return "9:16" }
+        if name.hasSuffix("_Horizontal") { return "16:9" }
+        if name.hasSuffix("_Sensor") { return "4:3" }
         return name
     }
 }
 
 enum Thumbnailer {
     static func image(for url: URL) async -> UIImage? {
+        if TakeStore.isPhoto(url) {
+            return await UIImage(contentsOfFile: url.path)?.byPreparingThumbnail(ofSize: CGSize(width: 300, height: 300))
+        }
         let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: 400, height: 400)
@@ -72,6 +107,11 @@ enum Thumbnailer {
     }
 
     static func details(for url: URL) async -> String {
+        if TakeStore.isPhoto(url) {
+            guard let image = UIImage(contentsOfFile: url.path) else { return "" }
+            let pixels = CGSize(width: image.size.width * image.scale, height: image.size.height * image.scale)
+            return "\(Int(pixels.width))×\(Int(pixels.height)) · HEIC"
+        }
         let asset = AVURLAsset(url: url)
         guard let track = try? await asset.loadTracks(withMediaType: .video).first,
               let loaded = try? await track.load(.naturalSize, .preferredTransform, .nominalFrameRate),

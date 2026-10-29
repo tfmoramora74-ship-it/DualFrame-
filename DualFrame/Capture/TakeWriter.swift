@@ -77,21 +77,28 @@ final class TakeWriter {
         let video: AVAssetWriterInput
         let adaptor: AVAssetWriterInputPixelBufferAdaptor
         let audio: AVAssetWriterInput?
-        let cropper: FrameCropper?
     }
 
     let folder: URL
+    private let renderer: FrameRenderer
+    private let hdr: Bool
+    private let mirror: Bool
     private var tracks: [Track] = []
     private var sessionStarted = false
     private var startTime: CMTime = .invalid
     private(set) var droppedFrames = 0
 
-    init(pending: PendingTake, bufferWidth: Int, bufferHeight: Int, audioSettings: [String: Any]?) throws {
+    init(pending: PendingTake, bufferWidth: Int, bufferHeight: Int, audioSettings: [String: Any]?,
+         renderer: FrameRenderer) throws {
         folder = pending.folder
+        self.renderer = renderer
+        hdr = pending.hdr
+        mirror = pending.mirror
         try FileManager.default.createDirectory(at: pending.folder, withIntermediateDirectories: true)
 
-        let plans = CropMath.plans(kinds: pending.outputs, bufferWidth: bufferWidth, bufferHeight: bufferHeight,
-                                   rotationDegrees: pending.rotationDegrees, resolution: pending.resolution)
+        let plans = CropMath.plans(kinds: pending.outputs, resolutions: pending.resolutions,
+                                   bufferWidth: bufferWidth, bufferHeight: bufferHeight,
+                                   rotationDegrees: pending.rotationDegrees)
         for plan in plans {
             let url = pending.folder.appendingPathComponent("\(pending.baseName)_\(plan.kind.fileSuffix).mov")
             let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
@@ -118,8 +125,7 @@ final class TakeWriter {
             guard writer.startWriting() else {
                 throw TakeWriterError.startFailed(plan.kind, writer.error?.localizedDescription ?? "desconhecido")
             }
-            tracks.append(Track(plan: plan, url: url, writer: writer, video: video, adaptor: adaptor, audio: audio,
-                                cropper: plan.isPassthrough ? nil : FrameCropper(plan: plan)))
+            tracks.append(Track(plan: plan, url: url, writer: writer, video: video, adaptor: adaptor, audio: audio))
         }
     }
 
@@ -130,12 +136,22 @@ final class TakeWriter {
             startTime = time
             sessionStarted = true
         }
+        let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        let colorSpace = hdr ? FrameRenderer.hdrVideoSpace : FrameRenderer.sdrVideoSpace
         for track in tracks where track.writer.status == .writing {
             guard track.video.isReadyForMoreMediaData else {
                 droppedFrames += 1
                 continue
             }
-            let frame = track.cropper?.process(pixelBuffer) ?? (track.cropper == nil ? pixelBuffer : nil)
+            let frame: CVPixelBuffer?
+            if track.plan.isPassthrough && !mirror {
+                frame = pixelBuffer
+            } else {
+                let image = renderer.image(from: pixelBuffer, crop: track.plan.crop, rotation: 0,
+                                           mirror: mirror, size: track.plan.size)
+                frame = renderer.render(image, size: track.plan.size, format: format, colorSpace: colorSpace,
+                                        tagsFrom: pixelBuffer)
+            }
             guard let frame else {
                 droppedFrames += 1
                 continue
@@ -175,11 +191,11 @@ final class TakeWriter {
             }
         }
         let dropped = droppedFrames
-        let urls = tracks.filter { FileManager.default.fileExists(atPath: $0.url.path) }.map(\.url)
+        let urls = tracks.map(\.url)
         let folder = self.folder
         group.notify(queue: .global()) {
-            completion(TakeResult(folder: folder, urls: urls, droppedFrames: dropped,
-                                  error: errors.joined))
+            let existing = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
+            completion(TakeResult(folder: folder, urls: existing, droppedFrames: dropped, error: errors.joined))
         }
     }
 }

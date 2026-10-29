@@ -1,3 +1,4 @@
+import AVKit
 import SwiftUI
 
 struct CameraScreen: View {
@@ -5,38 +6,65 @@ struct CameraScreen: View {
     @StateObject private var motion = LevelMotion()
     @StateObject private var store = TakeStore()
     @Environment(\.scenePhase) private var scenePhase
-    @State private var selectedControl: ManualControl?
+    @State private var showFormatPanel = false
+    @State private var showPro = false
+    @State private var proControl: ManualControl?
     @State private var showSettings = false
     @State private var showGallery = false
-    @State private var showFormatMenu = false
+    @State private var flashOpacity = 0.0
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            Color(white: 0.11).ignoresSafeArea()
+
             if model.denied {
                 permissionView
             } else {
-                VStack(spacing: 10) {
+                VStack(spacing: 0) {
                     topBar
-                    previewArea
-                    infoLine
-                    zoomRow
-                    ManualControlsView(model: model, selected: $selectedControl)
-                        .disabled(model.isFinishing)
-                    bottomBar
+                    PreviewStage(model: model, motion: motion)
+                        .padding(.top, 8)
+                    lensRow
+                        .padding(.top, 10)
+                    if showPro {
+                        ManualControlsView(model: model, selected: $proControl)
+                            .padding(.top, 10)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                    shutterRow
+                        .padding(.top, 14)
+                    modePicker
+                        .padding(.top, 14)
+                        .padding(.bottom, 6)
                 }
             }
-            if let toast = model.toast {
+
+            if showFormatPanel {
+                Color.black.opacity(0.001)
+                    .ignoresSafeArea()
+                    .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { showFormatPanel = false } }
                 VStack {
-                    Text(toast)
-                        .font(.system(size: 13, weight: .medium))
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 14).padding(.vertical, 9)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .padding(.top, 60)
+                    FormatPanel(model: model)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 58)
                     Spacer()
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
+            }
+
+            Color.white.opacity(flashOpacity).ignoresSafeArea().allowsHitTesting(false)
+
+            if let toast = model.toast {
+                VStack {
+                    Spacer()
+                    Text(toast)
+                        .font(.system(size: 14, weight: .medium))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 16).padding(.vertical, 10)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .padding(.bottom, 210)
+                }
+                .transition(.opacity)
                 .task(id: toast) {
                     try? await Task.sleep(nanoseconds: 3_000_000_000)
                     withAnimation { model.toast = nil }
@@ -44,7 +72,8 @@ struct CameraScreen: View {
             }
         }
         .preferredColorScheme(.dark)
-        .statusBarHidden()
+        .tint(.accentTeal)
+        .animation(.easeOut(duration: 0.2), value: showPro)
         .task {
             await model.start()
             motion.start()
@@ -56,215 +85,187 @@ struct CameraScreen: View {
             default: break
             }
         }
+        .onChange(of: model.flashTrigger) { _, _ in
+            flashOpacity = 0.85
+            withAnimation(.easeOut(duration: 0.35)) { flashOpacity = 0 }
+        }
         .sheet(isPresented: $showSettings) {
             SettingsView(model: model)
         }
-        .sheet(isPresented: $showGallery) {
+        .fullScreenCover(isPresented: $showGallery) {
             GalleryView(store: store)
         }
+        .background(ShutterButtonInteraction { model.shutterPressed() })
     }
 
     // MARK: Top bar
 
     private var topBar: some View {
-        HStack(spacing: 10) {
+        HStack {
             Button {
-                showFormatMenu.toggle()
+                withAnimation(.easeOut(duration: 0.2)) { showFormatPanel.toggle() }
             } label: {
-                HStack(spacing: 6) {
-                    Text(model.config.resolution.label).font(.system(size: 15, weight: .bold))
-                    Text("\(Int(model.state.fps))").font(.system(size: 15, weight: .bold))
-                    + Text(" FPS").font(.system(size: 9, weight: .bold)).foregroundColor(.cyan)
-                    if model.state.hdrActive {
-                        Text("HDR").font(.system(size: 10, weight: .heavy)).foregroundStyle(.orange)
+                HStack(spacing: 12) {
+                    chipValue(model.config.mode == .photo ? "FOTO" : primaryResolutionLabel, sub: "RES")
+                    if model.config.mode == .video {
+                        chipValue("\(Int(model.state.fps))", sub: model.state.hdrActive ? "HDR" : "FPS")
                     }
-                    Image(systemName: "slider.horizontal.3").foregroundStyle(.cyan)
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(Color.accentTeal)
                 }
-                .padding(.horizontal, 12).frame(height: 36)
-                .background(.white.opacity(0.12), in: Capsule())
+                .padding(.horizontal, 16)
+                .frame(height: 44)
+                .background(.black.opacity(0.55), in: Capsule())
             }
-            .popover(isPresented: $showFormatMenu) {
-                QuickFormatMenu(model: model)
-                    .presentationCompactAdaptation(.popover)
-            }
+            .disabled(model.isRecording)
+            .accessibilityLabel("Resolução e quadros por segundo")
 
             Spacer()
 
-            HStack(spacing: 4) {
-                ForEach(OutputKind.allCases) { kind in
-                    let on = model.config.outputs.contains(kind)
-                    Button {
-                        toggleOutput(kind)
-                    } label: {
-                        Text(kind.shortLabel)
-                            .font(.system(size: 12, weight: .bold))
-                            .frame(width: 40, height: 30)
-                            .background(on ? Color(kind.color).opacity(0.85) : Color.white.opacity(0.1),
-                                        in: RoundedRectangle(cornerRadius: 7))
-                            .foregroundStyle(on ? Color.black : Color.white.opacity(0.7))
-                    }
+            HStack(spacing: 18) {
+                if model.hasTorch {
+                    toolbarIcon(model.torchOn ? "bolt.fill" : "bolt.slash", active: model.torchOn,
+                                label: "Lanterna") { model.toggleTorch() }
                 }
-            }
-            .disabled(model.isRecording)
-
-            if model.hasTorch {
-                iconButton(model.torchOn ? "flashlight.on.fill" : "flashlight.off.fill",
-                           tint: model.torchOn ? .yellow : .white) { model.toggleTorch() }
-            }
-            iconButton("gearshape.fill") { showSettings = true }
+                toolbarIcon("camera.aperture", active: showPro, label: "Controles manuais") {
+                    showPro.toggle()
+                    if !showPro { proControl = nil }
+                }
+                toolbarIcon("arrow.triangle.2.circlepath.camera", active: false, label: "Virar câmera") {
+                    model.flipCamera()
+                }
                 .disabled(model.isRecording)
+                toolbarIcon("gearshape.fill", active: false, label: "Ajustes") { showSettings = true }
+                    .disabled(model.isRecording)
+            }
+            .padding(.horizontal, 18)
+            .frame(height: 44)
+            .background(.black.opacity(0.55), in: Capsule())
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+    }
+
+    private var primaryResolutionLabel: String {
+        let kinds = model.config.outputs
+        let labels = Set(kinds.map { model.config.resolution(for: $0).label })
+        if labels.count == 1, let only = labels.first { return only }
+        return labels.contains("4K") ? "4K" : (labels.contains("Nativa") ? "MAX" : "HD")
+    }
+
+    private func chipValue(_ value: String, sub: String) -> some View {
+        HStack(alignment: .top, spacing: 2) {
+            Text(value).font(.system(size: 17, weight: .bold))
+            Text(sub).font(.system(size: 8, weight: .bold)).foregroundStyle(Color.accentTeal).offset(y: 1)
         }
         .foregroundStyle(.white)
-        .padding(.horizontal, 12)
-        .padding(.top, 6)
     }
 
-    private func toggleOutput(_ kind: OutputKind) {
-        var outputs = model.config.outputs
-        if let index = outputs.firstIndex(of: kind) {
-            outputs.remove(at: index)
-        } else {
-            outputs.append(kind)
-            outputs.sort { OutputKind.allCases.firstIndex(of: $0)! < OutputKind.allCases.firstIndex(of: $1)! }
-        }
-        model.config.outputs = outputs
-    }
-
-    private func iconButton(_ name: String, tint: Color = .white, action: @escaping () -> Void) -> some View {
+    private func toolbarIcon(_ name: String, active: Bool, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: name)
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(tint)
-                .frame(width: 36, height: 36)
-                .background(.white.opacity(0.12), in: Circle())
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(active ? Color.accentTeal : Color.white)
+                .frame(width: 26, height: 44)
         }
+        .accessibilityLabel(label)
     }
 
-    // MARK: Preview
+    // MARK: Lens row
 
-    private var previewArea: some View {
-        ZStack {
-            PreviewView(model: model)
-            if model.config.showGrid { GridOverlay() }
-            if model.config.showCrosshair { CrosshairOverlay() }
-            if model.config.showLevel { LevelOverlay(motion: motion) }
-
-            VStack {
-                HStack(alignment: .top) {
-                    if model.config.showHistogram { HistogramView(values: model.histogram) }
-                    Spacer()
-                    if model.isRecording || model.isFinishing { recordingBadge }
-                }
-                Spacer()
-                HStack {
-                    Spacer()
-                    AudioMeter(level: model.audioLevel)
-                }
-            }
-            .padding(8)
-        }
-        .aspectRatio(3.0 / 4.0, contentMode: .fit)
-        .clipShape(RoundedRectangle(cornerRadius: 14))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14)
-                .stroke(model.isRecording ? Color.red : Color.white.opacity(0.15), lineWidth: model.isRecording ? 2 : 1)
-        )
-        .padding(.horizontal, 8)
-    }
-
-    private var recordingBadge: some View {
+    private var lensRow: some View {
         HStack(spacing: 6) {
-            Circle().fill(model.isFinishing ? Color.orange : Color.red).frame(width: 8, height: 8)
-            Text(model.isFinishing ? "Salvando…" : formatDuration(model.elapsed))
-                .font(.system(size: 13, weight: .semibold, design: .monospaced))
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 10).padding(.vertical, 5)
-        .background(.black.opacity(0.55), in: Capsule())
-    }
-
-    private var infoLine: some View {
-        VStack(spacing: 2) {
-            Text(model.outputSummary)
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.85))
-            if let format = model.state.activeFormat {
-                Text("Sensor \(format.width)×\(format.height) · \(model.config.codec.label) · estab. \(model.state.stabilizationActive)")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.white.opacity(0.5))
-            }
-        }
-        .lineLimit(1)
-        .minimumScaleFactor(0.7)
-        .padding(.horizontal, 12)
-    }
-
-    private var zoomRow: some View {
-        HStack(spacing: 10) {
-            ForEach(model.zoomPresets, id: \.self) { preset in
-                let active = abs(model.zoomDisplay - preset) < 0.05
+            ForEach(model.lensButtons) { button in
+                let active = model.isActive(button)
                 Button {
-                    model.setZoom(display: preset, animated: true)
+                    model.select(button)
                 } label: {
-                    Text(active ? String(format: "%.1f×", model.zoomDisplay) : zoomLabel(preset))
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(active ? Color.cyan : Color.white)
-                        .frame(width: 40, height: 40)
-                        .background(.white.opacity(active ? 0.2 : 0.08), in: Circle())
+                    Text(active ? zoomLabel(model.zoomDisplay) : button.label)
+                        .font(.system(size: active ? 13 : 12, weight: .bold))
+                        .foregroundStyle(active ? Color.accentTeal : Color.white)
+                        .frame(width: active ? 42 : 36, height: active ? 42 : 36)
+                        .background(Color.black.opacity(active ? 0.7 : 0.35), in: Circle())
                 }
+                .accessibilityLabel("Zoom \(button.label)")
             }
         }
+        .animation(.spring(duration: 0.25), value: model.zoomDisplay)
     }
 
     private func zoomLabel(_ value: CGFloat) -> String {
-        value < 1 ? String(format: ".%d", Int((value * 10).rounded())) : (value == value.rounded() ? "\(Int(value))" : String(format: "%.1f", value))
+        if value < 1 { return String(format: ",%d×", Int((value * 10).rounded())) }
+        let rounded = (value * 10).rounded() / 10
+        return rounded == rounded.rounded() ? "\(Int(rounded))×" : String(format: "%.1f×", rounded)
     }
 
-    // MARK: Bottom
+    // MARK: Shutter row
 
-    private var bottomBar: some View {
+    private var shutterRow: some View {
         HStack {
             Button {
                 showGallery = true
             } label: {
-                Image(systemName: "photo.on.rectangle.angled")
-                    .font(.system(size: 20))
-                    .frame(width: 52, height: 52)
-                    .background(.white.opacity(0.12), in: Circle())
-            }
-            .disabled(model.isRecording)
-
-            Spacer()
-
-            Button {
-                model.toggleRecording()
-            } label: {
-                ZStack {
-                    Circle().stroke(Color.white, lineWidth: 4).frame(width: 78, height: 78)
-                    RoundedRectangle(cornerRadius: model.isRecording ? 8 : 32)
-                        .fill(model.isFinishing ? Color.gray : Color.red)
-                        .frame(width: model.isRecording ? 32 : 64, height: model.isRecording ? 32 : 64)
+                Group {
+                    if let thumb = model.lastThumbnail {
+                        Image(uiImage: thumb).resizable().scaledToFill()
+                    } else {
+                        Image(systemName: "photo.on.rectangle").font(.system(size: 20)).foregroundStyle(.white)
+                    }
                 }
-                .animation(.spring(duration: 0.25), value: model.isRecording)
+                .frame(width: 52, height: 52)
+                .background(Color.black.opacity(0.4))
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.white.opacity(0.25)))
             }
-            .disabled(model.isFinishing)
+            .disabled(model.isRecording)
+            .accessibilityLabel("Gravações")
+
+            Spacer()
+
+            ShutterButton(mode: model.config.mode, isRecording: model.isRecording, isBusy: model.isBusy) {
+                model.shutterPressed()
+            }
 
             Spacer()
 
             Button {
-                guard !model.isRecording else { return }
-                model.config.lens = model.config.lens == .front ? .auto : .front
+                withAnimation(.spring(duration: 0.35)) {
+                    model.config.layout = model.config.layout == .split ? .pip : .split
+                }
             } label: {
-                Image(systemName: "arrow.triangle.2.circlepath.camera")
-                    .font(.system(size: 20))
+                Image(systemName: model.config.layout == .split ? "pip" : "rectangle.split.1x2")
+                    .font(.system(size: 21, weight: .medium))
+                    .foregroundStyle(Color.accentTeal)
                     .frame(width: 52, height: 52)
-                    .background(.white.opacity(0.12), in: Circle())
+                    .background(Color.black.opacity(0.4), in: Circle())
             }
-            .disabled(model.isRecording)
+            .accessibilityLabel(model.config.layout == .split ? "Prévia em janela flutuante" : "Prévias separadas")
         }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 28)
-        .padding(.bottom, 8)
+        .padding(.horizontal, 26)
+    }
+
+    // MARK: Mode picker
+
+    private var modePicker: some View {
+        HStack(spacing: 4) {
+            ForEach(CaptureMode.allCases) { mode in
+                let selected = model.config.mode == mode
+                Button {
+                    guard !model.isRecording else { return }
+                    withAnimation(.spring(duration: 0.3)) { model.config.mode = mode }
+                } label: {
+                    Text(mode.label)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(selected ? Color.white : Color.white.opacity(0.75))
+                        .frame(width: 96, height: 38)
+                        .background(selected ? Color.accentTeal : Color.clear, in: Capsule())
+                }
+            }
+        }
+        .padding(4)
+        .background(Color.black.opacity(0.55), in: Capsule())
+        .overlay(Capsule().strokeBorder(.white.opacity(0.1)))
     }
 
     private var permissionView: some View {
@@ -282,46 +283,127 @@ struct CameraScreen: View {
     }
 }
 
-/// The resolution / frame-rate chip menu (like the original's top-left chip).
-struct QuickFormatMenu: View {
+struct ShutterButton: View {
+    let mode: CaptureMode
+    let isRecording: Bool
+    let isBusy: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle()
+                    .strokeBorder(mode == .video ? Color.accentTeal : Color.white, lineWidth: 5)
+                    .frame(width: 84, height: 84)
+                if mode == .photo {
+                    Circle().fill(Color.white).frame(width: 66, height: 66)
+                        .scaleEffect(isBusy ? 0.85 : 1)
+                } else {
+                    RoundedRectangle(cornerRadius: isRecording ? 8 : 33, style: .continuous)
+                        .fill(isBusy ? Color.gray : Color.red)
+                        .frame(width: isRecording ? 32 : 66, height: isRecording ? 32 : 66)
+                }
+            }
+            .animation(.spring(duration: 0.25), value: isRecording)
+            .animation(.spring(duration: 0.15), value: isBusy)
+        }
+        .disabled(isBusy && !isRecording)
+        .accessibilityLabel(mode == .photo ? "Tirar foto" : (isRecording ? "Parar gravação" : "Gravar"))
+    }
+}
+
+/// Volume buttons (and Camera Control) fire the shutter while the camera is on screen.
+struct ShutterButtonInteraction: UIViewRepresentable {
+    let action: () -> Void
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.isUserInteractionEnabled = true
+        if #available(iOS 17.2, *) {
+            let interaction = AVCaptureEventInteraction { event in
+                if event.phase == .ended { context.coordinator.action() }
+            }
+            view.addInteraction(interaction)
+        }
+        return view
+    }
+
+    func updateUIView(_ view: UIView, context: Context) {
+        context.coordinator.action = action
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(action: action) }
+
+    final class Coordinator {
+        var action: () -> Void
+        init(action: @escaping () -> Void) { self.action = action }
+    }
+}
+
+/// Drop-down panel under the resolution chip: per-format resolution, frame rate and HDR.
+struct FormatPanel: View {
     @ObservedObject var model: CameraModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            row("RESOLUÇÃO") {
-                ForEach(OutputResolution.allCases) { res in
-                    option(res.label, selected: model.config.resolution == res) { model.config.resolution = res }
+        VStack(alignment: .leading, spacing: 16) {
+            ForEach(OutputKind.allCases) { kind in
+                row(kind.menuTitle) {
+                    let enabled = model.config.isEnabled(kind)
+                    let current = model.config.resolution(for: kind)
+                    ForEach(OutputResolution.allCases) { resolution in
+                        option(resolution.label, selected: enabled && current == resolution) {
+                            model.config.setResolution(resolution, for: kind)
+                            model.config.setEnabled(kind, true)
+                        }
+                    }
+                    option("Off", selected: !enabled) { model.config.setEnabled(kind, false) }
                 }
             }
-            row("FPS") {
-                ForEach([24, 25, 30, 48, 50, 60], id: \.self) { fps in
-                    option("\(fps)", selected: model.config.fps == fps) { model.config.fps = fps }
+            if model.config.mode == .video {
+                Divider().overlay(Color.white.opacity(0.1))
+                row("FRAME RATE") {
+                    ForEach([24, 25, 30, 60], id: \.self) { fps in
+                        option("\(fps)", selected: model.config.fps == fps) { model.config.fps = fps }
+                    }
+                }
+                row("HDR") {
+                    option("SDR", selected: !model.config.hdr) { model.config.hdr = false }
+                    option("HLG 10-bit", selected: model.config.hdr) { model.config.hdr = true }
                 }
             }
-            row("HDR") {
-                option("SDR", selected: !model.config.hdr) { model.config.hdr = false }
-                option("HDR HLG", selected: model.config.hdr) { model.config.hdr = true }
+            if !model.state.notes.isEmpty {
+                ForEach(model.state.notes, id: \.self) { note in
+                    Label(note, systemImage: "info.circle")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.6))
+                }
             }
         }
-        .padding(16)
-        .frame(minWidth: 300)
-        .disabled(model.isRecording)
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .environment(\.colorScheme, .dark)
     }
 
     private func row<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title).font(.system(size: 10, weight: .bold)).foregroundStyle(.secondary)
-            HStack(spacing: 6) { content() }
+        HStack(spacing: 0) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.55))
+                .frame(width: 100, alignment: .leading)
+            HStack(spacing: 4) { content() }
         }
     }
 
     private func option(_ label: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text(label)
-                .font(.system(size: 13, weight: .semibold))
-                .padding(.horizontal, 10).padding(.vertical, 6)
-                .background(selected ? Color.cyan : Color.secondary.opacity(0.2), in: Capsule())
-                .foregroundStyle(selected ? Color.black : Color.primary)
+            HStack(spacing: 4) {
+                if selected { Circle().fill(Color.accentTeal).frame(width: 5, height: 5) }
+                Text(label)
+                    .font(.system(size: 15, weight: selected ? .bold : .regular))
+                    .foregroundStyle(selected ? Color.accentTeal : Color.white)
+            }
+            .frame(minWidth: 52, minHeight: 32)
         }
     }
 }

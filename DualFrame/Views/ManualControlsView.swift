@@ -11,52 +11,52 @@ struct ManualControlsView: View {
                 panel(for: selected)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(ManualControl.allCases) { control in
-                        chip(control)
-                    }
-                    Button {
-                        model.resetAll()
-                    } label: {
-                        Image(systemName: "arrow.counterclockwise")
-                            .font(.system(size: 13, weight: .semibold))
-                            .frame(width: 34, height: 34)
-                            .background(.white.opacity(0.12), in: Circle())
-                    }
+            HStack(spacing: 6) {
+                ForEach(ManualControl.allCases) { control in
+                    chip(control)
                 }
-                .padding(.horizontal, 12)
+                Button {
+                    model.resetManual()
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.system(size: 13, weight: .semibold))
+                        .frame(width: 36, height: 40)
+                        .background(.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+                .accessibilityLabel("Voltar tudo para automático")
             }
+            .padding(.horizontal, 12)
         }
         .foregroundStyle(.white)
         .animation(.easeOut(duration: 0.18), value: selected)
     }
 
+    private func isManual(_ control: ManualControl) -> Bool {
+        switch control {
+        case .iso, .shutter: return model.manualExposure
+        case .whiteBalance: return model.manualWB
+        case .focus: return model.manualFocus
+        case .exposureBias: return abs(model.exposureBias) > 0.05
+        }
+    }
+
     private func chip(_ control: ManualControl) -> some View {
         let isOn = selected == control
-        let manual: Bool = {
-            switch control {
-            case .iso, .shutter: return model.manualExposure
-            case .whiteBalance: return model.manualWB
-            case .focus: return model.manualFocus
-            case .exposureBias: return abs(model.exposureBias) > 0.05
-            case .zoom: return false
-            }
-        }()
         return Button {
             selected = isOn ? nil : control
         } label: {
             VStack(spacing: 1) {
-                Text(control.title)
+                Text(isManual(control) ? control.title : "\(control.title) A")
                     .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(manual ? Color.cyan : Color.white.opacity(0.6))
+                    .foregroundStyle(isManual(control) ? Color.accentTeal : Color.white.opacity(0.55))
                 Text(value(control))
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
             }
-            .frame(minWidth: 54, minHeight: 34)
-            .padding(.horizontal, 4)
-            .background(isOn ? Color.cyan.opacity(0.3) : Color.white.opacity(0.12),
-                        in: RoundedRectangle(cornerRadius: 8))
+            .frame(maxWidth: .infinity, minHeight: 40)
+            .background(isOn ? Color.accentTeal.opacity(0.3) : Color.black.opacity(0.45),
+                        in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
     }
 
@@ -67,7 +67,6 @@ struct ManualControlsView: View {
         case .whiteBalance: return "\(Int(model.temperature / 100) * 100)K"
         case .focus: return String(format: "%.2f", model.lensPosition)
         case .exposureBias: return String(format: "%+.1f", model.exposureBias)
-        case .zoom: return String(format: "%.1f×", model.zoomDisplay)
         }
     }
 
@@ -79,7 +78,7 @@ struct ManualControlsView: View {
                         value: Double(model.iso),
                         range: Double(model.isoRange.lowerBound)...Double(model.isoRange.upperBound),
                         logarithmic: true,
-                        enabled: model.supportsManualExposure,
+                        unsupported: model.supportsManualExposure ? nil : "Esta lente não permite ISO manual.",
                         isAuto: !model.manualExposure,
                         onChange: { model.setISO(Float($0)) },
                         onAuto: { model.setExposureAuto() })
@@ -88,46 +87,37 @@ struct ManualControlsView: View {
                         value: model.shutter,
                         range: model.shutterRange,
                         logarithmic: true,
-                        enabled: model.supportsManualExposure,
+                        unsupported: model.supportsManualExposure ? nil : "Esta lente não permite obturador manual.",
                         isAuto: !model.manualExposure,
                         onChange: { model.setShutter($0) },
                         onAuto: { model.setExposureAuto() })
         case .whiteBalance:
             SliderPanel(title: "Balanço de branco \(Int(model.temperature))K",
                         value: Double(model.temperature),
-                        range: 2000...10000,
+                        range: 2500...9000,
                         logarithmic: false,
-                        enabled: model.supportsManualWB,
+                        unsupported: model.supportsManualWB ? nil : "Esta lente não permite balanço de branco manual.",
                         isAuto: !model.manualWB,
-                        onChange: { model.setWhiteBalance(temperature: Float($0), tint: 0) },
+                        onChange: { model.setWhiteBalance(temperature: Float($0)) },
                         onAuto: { model.setWhiteBalanceAuto() })
         case .focus:
-            SliderPanel(title: "Foco \(String(format: "%.2f", model.lensPosition))  (0 = perto · 1 = infinito)",
+            SliderPanel(title: "Foco \(String(format: "%.2f", model.lensPosition))  ·  perto ← → infinito",
                         value: Double(model.lensPosition),
                         range: 0...1,
                         logarithmic: false,
-                        enabled: model.supportsManualFocus,
+                        unsupported: model.supportsManualFocus ? nil : "Esta lente não tem foco manual (foco fixo).",
                         isAuto: !model.manualFocus,
                         onChange: { model.setFocus(Float($0)) },
                         onAuto: { model.setFocusAuto() })
         case .exposureBias:
-            SliderPanel(title: "Compensação \(String(format: "%+.1f", model.exposureBias)) EV",
+            SliderPanel(title: "Exposição \(String(format: "%+.1f", model.exposureBias)) EV",
                         value: Double(model.exposureBias),
-                        range: Double(max(-4, model.biasRange.lowerBound))...Double(min(4, model.biasRange.upperBound)),
+                        range: Double(model.biasRange.lowerBound)...Double(model.biasRange.upperBound),
                         logarithmic: false,
-                        enabled: true,
+                        unsupported: nil,
                         isAuto: abs(model.exposureBias) < 0.05,
                         onChange: { model.setExposureBias(Float(($0 * 10).rounded() / 10)) },
                         onAuto: { model.setExposureBias(0) })
-        case .zoom:
-            SliderPanel(title: "Zoom \(String(format: "%.1f×", model.zoomDisplay))",
-                        value: Double(model.zoomDisplay),
-                        range: Double(model.zoomRange.lowerBound)...Double(model.zoomRange.upperBound),
-                        logarithmic: true,
-                        enabled: true,
-                        isAuto: false,
-                        onChange: { model.setZoom(display: CGFloat($0), animated: false) },
-                        onAuto: { model.setZoom(display: 1, animated: true) })
         }
     }
 }
@@ -137,7 +127,7 @@ private struct SliderPanel: View {
     let value: Double
     let range: ClosedRange<Double>
     let logarithmic: Bool
-    let enabled: Bool
+    let unsupported: String?
     let isAuto: Bool
     let onChange: (Double) -> Void
     let onAuto: () -> Void
@@ -145,18 +135,21 @@ private struct SliderPanel: View {
     @State private var dragging: Double?
 
     var body: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: 6) {
             HStack {
-                Text(enabled ? title : "\(title) — não suportado por esta lente")
-                    .font(.system(size: 12, weight: .medium))
+                Text(unsupported ?? title)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(unsupported == nil ? Color.white : Color.orange)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
                 Spacer()
-                Button(isAuto ? "AUTO" : "Auto") { onAuto() }
-                    .font(.system(size: 11, weight: .bold))
-                    .padding(.horizontal, 10).padding(.vertical, 4)
-                    .background(isAuto ? Color.cyan : Color.white.opacity(0.15), in: Capsule())
-                    .foregroundStyle(isAuto ? Color.black : Color.white)
+                Button(action: onAuto) {
+                    Text("AUTO")
+                        .font(.system(size: 11, weight: .bold))
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(isAuto ? Color.accentTeal : Color.white.opacity(0.15), in: Capsule())
+                        .foregroundStyle(isAuto ? Color.black : Color.white)
+                }
             }
             Slider(value: Binding(get: { dragging ?? toSlider(value) },
                                   set: { newValue in
@@ -165,12 +158,12 @@ private struct SliderPanel: View {
                                   }),
                    in: 0...1,
                    onEditingChanged: { editing in if !editing { dragging = nil } })
-                .tint(.cyan)
-                .disabled(!enabled)
+                .tint(.accentTeal)
+                .disabled(unsupported != nil)
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
+        .padding(.vertical, 10)
+        .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .padding(.horizontal, 12)
     }
 
