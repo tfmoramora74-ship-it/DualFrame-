@@ -36,6 +36,8 @@ struct SettingsView: View {
                            selection: $model.config.codec, options: VideoCodecChoice.allCases) { $0.label }
                     picker("Qualidade", "Taxa de bits do vídeo.",
                            selection: $model.config.quality, options: BitrateQuality.allCases) { $0.label }
+                    toggle("Borda vermelha ao gravar", "Contorno vermelho na prévia enquanto grava.",
+                           isOn: $model.config.recordingBorder)
                     toggle("Medidor de nível de áudio", "Medidor discreto durante a gravação; fica vermelho quando satura.",
                            isOn: $model.config.audioMeter)
                     toggle("Espelhar câmera frontal", "Salva o vídeo da câmera frontal espelhado, como na prévia.",

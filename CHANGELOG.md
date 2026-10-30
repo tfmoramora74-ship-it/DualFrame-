@@ -2,6 +2,10 @@
 
 Todas as versões do DualFrame. O IPA mais recente está sempre na release [`latest`](https://github.com/tfmoramora74-ship-it/DualFrame-/releases/tag/latest).
 
+## 1.11
+- Borda vermelha de gravação igual nos quatro lados na prévia em tela cheia (segue os cantos arredondados da tela).
+- Nova opção em Ajustes: **Borda vermelha ao gravar** (ligar/desligar).
+
 ## 1.10
 - **Cores do frente + trás corrigidas de vez:** as duas câmeras ficam travadas em sRGB (o iOS ligava o Display P3 sozinho) e todo arquivo agora declara a cor exata que o sensor entregou, em qualquer modo.
 

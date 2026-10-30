@@ -147,11 +147,16 @@ struct FormatTile: View {
         }
         .keepingAspect(fullBleed ? nil : CGFloat(kind.uprightAspect))
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .strokeBorder(model.isRecording && enabled ? Color.red.opacity(0.9) : Color.white.opacity(fullBleed ? 0 : 0.18),
-                              lineWidth: model.isRecording && enabled ? 2 : 1)
-        )
+        .overlay {
+            // Full-screen previews get their recording border from the screen itself (CameraScreen),
+            // which follows the display's rounded corners on all four sides.
+            if !fullBleed {
+                let recording = model.isRecording && enabled && model.config.recordingBorder
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(recording ? Color.red.opacity(0.9) : Color.white.opacity(0.18),
+                                  lineWidth: recording ? 2 : 1)
+            }
+        }
         .onChange(of: model.aeafLocked) { _, locked in
             if !locked { withAnimation { focusPoint = nil } }
         }

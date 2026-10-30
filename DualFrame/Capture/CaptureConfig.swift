@@ -243,6 +243,8 @@ struct CaptureConfig: Codable, Equatable {
     var timerSeconds = 0
     /// Shows real fps, processing time and dropped frames on the preview.
     var showDiagnostics = false
+    /// Red frame around the picture while recording.
+    var recordingBorder = true
     var audioMeter = true
     var saveToPhotos = false
     var keepManualControls = false

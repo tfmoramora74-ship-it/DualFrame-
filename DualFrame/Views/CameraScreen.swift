@@ -48,6 +48,16 @@ struct CameraScreen: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
+                // Recording border for the full-screen layout: drawn on the screen outline (inside the
+                // display's rounded corners) so it shows evenly on all four sides.
+                if model.isRecording, model.config.recordingBorder, model.config.layout == .pip, !fullOnly {
+                    RoundedRectangle(cornerRadius: displayCornerRadius, style: .continuous)
+                        .strokeBorder(Color.red.opacity(0.9), lineWidth: 3)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+
                 Color.white.opacity(flashOpacity).ignoresSafeArea().allowsHitTesting(false)
 
                 if let toast = model.toast {
@@ -354,6 +364,9 @@ struct CameraScreen: View {
         case .superResolution: return "27MP"
         }
     }
+
+    /// Close to the rounded corners of current Face ID iPhones; keeps the border inside the glass.
+    private let displayCornerRadius: CGFloat = 48
 
     /// Only the 4:3 file is on: a single framed preview, no window layout.
     private var fullOnly: Bool {
