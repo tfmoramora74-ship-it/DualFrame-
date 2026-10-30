@@ -2,6 +2,10 @@
 
 Todas as versões do DualFrame. O IPA mais recente está sempre na release [`latest`](https://github.com/tfmoramora74-ship-it/DualFrame-/releases/tag/latest).
 
+## 1.9
+- **Frente + trás:** cores corrigidas (os valores das duas câmeras passam sem conversão) e gravação fluida: a selfie chega numa fila própria, o 9:16 é gravado em HD exato a partir do sensor 1920×1440 e a prévia reaproveita o quadro gravado.
+- Novo **diagnóstico de desempenho** (Ajustes › Sobre): fps reais, tempo de processamento e quadros perdidos na prévia.
+
 ## 1.8
 - **Frente + trás estável:** ligar e desligar o modo não fecha mais o app.
 - Frente + trás mostra e grava só o 9:16, com a tela travada em pé.

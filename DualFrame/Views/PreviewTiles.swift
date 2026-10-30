@@ -338,6 +338,24 @@ private struct PreviewHUD: View {
             .padding(.horizontal, 16)
             .padding(.top, 6)
 
+            if model.config.showDiagnostics {
+                VStack {
+                    Spacer()
+                    HStack {
+                        let d = model.diagnostics
+                        Text(String(format: "%.0f fps · %.1f ms · %d perdidos%@", d.fps, d.processingMs, d.dropped,
+                                    d.hardwareCost > 0 ? String(format: " · custo %.2f", d.hardwareCost) : ""))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(d.dropped > 0 || d.fps < 24 ? Color.orange : Color.green)
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(.black.opacity(0.6), in: Capsule())
+                        Spacer()
+                    }
+                    .padding(.leading, 10)
+                    .padding(.bottom, 10)
+                }
+            }
+
             if let countdown = model.countdown {
                 Text("\(countdown)")
                     .font(.system(size: 96, weight: .thin).monospacedDigit())

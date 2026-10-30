@@ -138,7 +138,11 @@ final class TakeWriter {
         }
     }
 
-    func appendVideo(_ sampleBuffer: CMSampleBuffer, pixelBuffer: CVPixelBuffer, overlay: FrontOverlay? = nil) {
+    /// Returns the frames it rendered per format, so a live preview can reuse them for free.
+    @discardableResult
+    func appendVideo(_ sampleBuffer: CMSampleBuffer, pixelBuffer: CVPixelBuffer,
+                     overlay: FrontOverlay? = nil) -> [OutputKind: CVPixelBuffer] {
+        var rendered: [OutputKind: CVPixelBuffer] = [:]
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if !sessionStarted {
             for track in tracks { track.writer.startSession(atSourceTime: time) }
@@ -153,12 +157,13 @@ final class TakeWriter {
             }
             let frame: CVPixelBuffer?
             if bake {
-                // Front + back: upright pixels with the selfie window drawn in.
+                // Front + back: upright pixels with the selfie window drawn in. Both cameras' encoded
+                // values pass through unconverted (a colour round trip here shifted gamma and saturation).
                 let size = CropMath.uprightSize(track.plan.size, rotationDegrees: Double(rotation))
                 let image = renderer.image(from: pixelBuffer, crop: track.plan.crop, rotation: rotation,
-                                           mirror: mirror, size: size)
+                                           mirror: mirror, size: size, colorManaged: false)
                 frame = renderer.render(OverlayCompositor.compose(image, size: size, overlay: overlay), size: size,
-                                        format: format, colorSpace: FrameRenderer.videoSpace, tagsFrom: pixelBuffer)
+                                        format: format, colorSpace: nil, tagsFrom: pixelBuffer)
             } else if track.plan.isPassthrough && !mirror {
                 frame = pixelBuffer
             } else {
@@ -173,7 +178,9 @@ final class TakeWriter {
                 continue
             }
             track.adaptor.append(frame, withPresentationTime: time)
+            rendered[track.plan.kind] = frame
         }
+        return rendered
     }
 
     func appendAudio(_ sampleBuffer: CMSampleBuffer) {

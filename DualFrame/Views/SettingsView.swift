@@ -76,6 +76,9 @@ struct SettingsView: View {
                     LabeledContent("Estabilização pedida", value: model.state.stabilizationRequested)
                     ActiveStabilizationRow(readouts: readouts)
                     LabeledContent("Versão", value: appVersion)
+                    toggle("Diagnóstico de desempenho",
+                           "Mostra na prévia os quadros por segundo reais, o tempo de processamento e quadros perdidos.",
+                           isOn: $model.config.showDiagnostics)
                     ForEach(model.state.notes, id: \.self) { note in
                         Label(note, systemImage: "info.circle")
                             .font(.footnote)

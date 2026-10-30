@@ -241,6 +241,8 @@ struct CaptureConfig: Codable, Equatable {
     /// Colours in-focus edges.
     var focusPeaking = false
     var timerSeconds = 0
+    /// Shows real fps, processing time and dropped frames on the preview.
+    var showDiagnostics = false
     var audioMeter = true
     var saveToPhotos = false
     var keepManualControls = false

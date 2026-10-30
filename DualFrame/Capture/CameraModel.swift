@@ -88,6 +88,7 @@ final class CameraModel: ObservableObject {
     @Published private(set) var remainingLabel = ""
     @Published private(set) var thermalWarning: String?
     @Published private(set) var previewsPaused = false
+    @Published private(set) var diagnostics = CaptureEngine.Diagnostics()
 
     let meters = LiveMeters()
     let motion = LevelMotion()
@@ -128,6 +129,12 @@ final class CameraModel: ObservableObject {
         }
         engine.onStackProgress = { [weak self] progress in
             Task { @MainActor in self?.stackProgress = progress }
+        }
+        engine.onDiagnostics = { [weak self] value in
+            Task { @MainActor in
+                guard let self, self.config.showDiagnostics, self.diagnostics != value else { return }
+                self.diagnostics = value
+            }
         }
         engine.onThermalLoad = { [weak self] load in
             Task { @MainActor in self?.thermalLoadChanged(load) }
@@ -305,7 +312,8 @@ final class CameraModel: ObservableObject {
     /// Upright size of each output for the tile captions.
     func outputSize(for kind: OutputKind) -> CGSize? {
         guard bufferSize.width > 0 else { return nil }
-        let plan = CropMath.plans(kinds: [kind], resolutions: [kind: config.resolution(for: kind)],
+        let resolution = state.dualActive && kind == .vertical ? .hd : config.resolution(for: kind)
+        let plan = CropMath.plans(kinds: [kind], resolutions: [kind: resolution],
                                   bufferWidth: Int(bufferSize.width), bufferHeight: Int(bufferSize.height),
                                   rotationDegrees: captureRotation)[0]
         if config.mode.isStill {
@@ -385,6 +393,9 @@ final class CameraModel: ObservableObject {
         lockedRotation = rotation
         var resolutions: [OutputKind: OutputResolution] = [:]
         for kind in OutputKind.allCases { resolutions[kind] = config.resolution(for: kind) }
+        // Front + back: the back sensor runs at ~1920×1440, so the vertical file is HD (upscaling to
+        // 4K with two cameras running only cost frame rate).
+        if state.dualActive { resolutions[.vertical] = .hd }
         let take = PendingTake(outputs: activeOutputs, resolutions: resolutions, codec: config.codec,
                                quality: config.quality, fps: state.fps, dynamicRange: state.dynamicRange,
                                rotationDegrees: rotation, mirror: isFront && config.mirrorFront,

@@ -2,6 +2,7 @@ import AVFoundation
 import CoreImage
 import CoreMedia
 import Photos
+import QuartzCore
 import VideoToolbox
 
 /// A sensor format the user can pick by hand.
@@ -73,6 +74,8 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
     let sessionQueue = DispatchQueue(label: "dualframe.session")
     private let outputQueue = DispatchQueue(label: "dualframe.output", qos: .userInitiated)
     private let photoQueue = DispatchQueue(label: "dualframe.photo", qos: .userInitiated)
+    private let frontQueue = DispatchQueue(label: "dualframe.front", qos: .userInitiated)
+    private let frontLock = NSLock()
     // Outputs are replaced together with the session: iOS does not reliably accept an output
     // that already belonged to another (configured) session — reusing them crashed the app.
     private var videoOutput = AVCaptureVideoDataOutput()
@@ -101,6 +104,7 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
                         completion: @Sendable (TakeResult) -> Void)?
     private var burst: (request: BurstRequest, frames: [CVPixelBuffer], completion: @Sendable (TakeResult) -> Void)?
     private var awaitingFirstFrame = false
+    private var stats = Stats()
     private var frameCount = 0
     private var audioCount = 0
     private var lastBufferSize = CGSize.zero
@@ -255,6 +259,58 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
         CVBufferPropagateAttachments(pixelBuffer, small)
         CVBufferRemoveAttachment(small, kCVImageBufferCleanApertureKey)
         return VTPixelTransferSessionTransferImage(scaler, from: pixelBuffer, to: small) == noErr ? small : pixelBuffer
+    }
+
+    /// Sends an already rendered (YUV) frame straight to the preview layers; the layer scales it.
+    private func showRecordedFrame(_ frame: CVPixelBuffer, kind: OutputKind, time: CMTime, spec: PreviewSpec) -> Bool {
+        lock.lock()
+        let layers = (previewSinks[kind] ?? []).compactMap(\.layer)
+        lock.unlock()
+        guard !spec.paused, !layers.isEmpty, let sample = Self.displaySample(frame, time: time) else { return false }
+        for layer in layers {
+            let sink = layer.sampleBufferRenderer
+            if sink.status == .failed || sink.requiresFlushToResumeDecoding { sink.flush() }
+            sink.enqueue(sample)
+        }
+        return true
+    }
+
+    // MARK: Diagnostics
+
+    /// Frames per second actually delivered, average processing time and drops (output queue only).
+    struct Stats {
+        var frames = 0
+        var dropped = 0
+        var busy: Double = 0
+        var windowStart: CFTimeInterval = 0
+
+        mutating func frame(processing: Double, at now: CFTimeInterval) {
+            if windowStart == 0 { windowStart = now }
+            frames += 1
+            busy += processing
+        }
+    }
+
+    struct Diagnostics: Equatable {
+        var fps: Double = 0
+        var processingMs: Double = 0
+        var dropped = 0
+        var hardwareCost: Double = 0
+    }
+
+    var onDiagnostics: (@Sendable (Diagnostics) -> Void)?
+
+    private func publishStatsIfDue() {
+        let now = CACurrentMediaTime()
+        guard stats.windowStart > 0, now - stats.windowStart >= 1 else { return }
+        let elapsed = now - stats.windowStart
+        var diagnostics = Diagnostics()
+        diagnostics.fps = Double(stats.frames) / elapsed
+        diagnostics.processingMs = stats.frames > 0 ? stats.busy / Double(stats.frames) * 1000 : 0
+        diagnostics.dropped = stats.dropped
+        if let multi = session as? AVCaptureMultiCamSession { diagnostics.hardwareCost = Double(multi.hardwareCost) }
+        stats = Stats()
+        onDiagnostics?(diagnostics)
     }
 
     // MARK: Heat
@@ -591,8 +647,10 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
             audioOutput = AVCaptureAudioDataOutput()
             photoOutput = AVCapturePhotoOutput()
             frontOutput = AVCaptureVideoDataOutput()
-            latestFront = nil
         }
+        frontLock.lock()
+        latestFront = nil
+        frontLock.unlock()
         session = multiCam ? AVCaptureMultiCamSession() : AVCaptureSession()
         videoInput = nil
         audioInput = nil
@@ -640,7 +698,7 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
             videoOutput.alwaysDiscardsLateVideoFrames = true
             frontOutput.alwaysDiscardsLateVideoFrames = true
             videoOutput.setSampleBufferDelegate(self, queue: outputQueue)
-            frontOutput.setSampleBufferDelegate(self, queue: outputQueue)
+            frontOutput.setSampleBufferDelegate(self, queue: frontQueue)
             audioOutput.setSampleBufferDelegate(self, queue: outputQueue)
             for output in [videoOutput, frontOutput, audioOutput] as [AVCaptureOutput] where multi.canAddOutput(output) {
                 multi.addOutputWithNoConnections(output)
@@ -673,9 +731,16 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
 
         // Biggest 4:3 back format that fits the shared hardware budget, with a modest selfie format.
         let fps = min(Double(config.fps), 30)
+        // 1920×1440 gives an exact 1080×1920 vertical with no scaling; bigger modes cost bandwidth
+        // and heat for no gain at HD, so they come last.
         let backFormats = back.formats
             .filter { $0.isMultiCamSupported && Self.isFourByThree($0) && Self.maxFPS($0) >= fps }
-            .sorted { Self.dimensions($0).width > Self.dimensions($1).width }
+            .sorted {
+                let a = Int(Self.dimensions($0).width), b = Int(Self.dimensions($1).width)
+                let aFits = a <= 1920, bFits = b <= 1920
+                if aFits != bFits { return aFits }
+                return a > b
+            }
         let frontFormats = front.formats
             .filter { $0.isMultiCamSupported && Self.isFourByThree($0) && Self.maxFPS($0) >= fps }
             .sorted { Self.dimensions($0).width < Self.dimensions($1).width }
@@ -741,9 +806,13 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
     }
 
     /// The newest selfie frame, upright for the way the phone is held, as a compositing layer.
-    private func frontOverlay(spec: PreviewSpec) -> FrontOverlay? {
-        guard let overlay = spec.overlay, let front = latestFront else { return nil }
-        var image = CIImage(cvPixelBuffer: front)
+    /// `managed: false` keeps the selfie's encoded values (for files composed without colour conversion).
+    private func frontOverlay(spec: PreviewSpec, managed: Bool = true) -> FrontOverlay? {
+        frontLock.lock()
+        let latest = latestFront
+        frontLock.unlock()
+        guard let overlay = spec.overlay, let front = latest else { return nil }
+        var image = FrameRenderer.source(front, colorManaged: managed)
         if let orientation = FrameRenderer.orientation(for: CropMath.normalizedRotation(spec.frontRotation)) {
             image = image.oriented(orientation)
         }
@@ -1102,10 +1171,18 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
 }
 
 extension CaptureEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
+    func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        if output === videoOutput { stats.dropped += 1 }
+    }
+
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         if output === frontOutput {
-            latestFront = CMSampleBufferGetImageBuffer(sampleBuffer)
+            let buffer = CMSampleBufferGetImageBuffer(sampleBuffer)
+            frontLock.lock()
+            latestFront = buffer
+            frontLock.unlock()
             return
         }
         if output === videoOutput {
@@ -1132,15 +1209,25 @@ extension CaptureEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                     onError?(error.localizedDescription)
                 }
             }
+            let started = CACurrentMediaTime()
+            var previewDone = false
             if let writer {
                 lock.lock()
                 let spec = previewSpec
                 lock.unlock()
-                writer.appendVideo(sampleBuffer, pixelBuffer: pixelBuffer, overlay: frontOverlay(spec: spec))
+                let rendered = writer.appendVideo(sampleBuffer, pixelBuffer: pixelBuffer,
+                                                  overlay: frontOverlay(spec: spec, managed: false))
+                // Front + back while recording: show the frame that was just written instead of
+                // rendering the same picture a second time.
+                if spec.overlay != nil, let frame = rendered[.vertical] {
+                    previewDone = showRecordedFrame(frame, kind: .vertical, time: time, spec: spec)
+                }
             }
             if stack != nil { stackFrame(pixelBuffer, time: time) }
             if burst != nil { collectBurst(pixelBuffer) }
-            pushPreviews(pixelBuffer, time: time)
+            if !previewDone { pushPreviews(pixelBuffer, time: time) }
+            stats.frame(processing: CACurrentMediaTime() - started, at: started)
+            publishStatsIfDue()
 
             frameCount += 1
             if wantsHistogram, frameCount % 6 == 0, let onHistogram {
