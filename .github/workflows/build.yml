@@ -52,12 +52,25 @@ jobs:
           name: DualFrame-ipa
           path: DualFrame.ipa
 
+      - name: Read version
+        id: version
+        run: |
+          echo "marketing=$(grep -m1 'MARKETING_VERSION' project.yml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+          echo "build=$(grep -m1 'CURRENT_PROJECT_VERSION' project.yml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
       - name: Publish rolling release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: DualFrame (latest build)
-          body: Unsigned IPA for LiveContainer. Built from ${{ github.sha }}.
+          name: DualFrame ${{ steps.version.outputs.marketing }} (build ${{ steps.version.outputs.build }})
+          body: |
+            IPA sem assinatura para instalar pelo LiveContainer (iOS 17+).
+
+            1. Baixe **DualFrame.ipa** abaixo.
+            2. No LiveContainer, toque em **+** e escolha o arquivo.
+
+            Novidades: veja o [CHANGELOG](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md).
+            Compilado a partir de ${{ github.sha }}.
           prerelease: true
           files: DualFrame.ipa
 
