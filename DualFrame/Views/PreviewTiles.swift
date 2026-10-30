@@ -65,7 +65,7 @@ struct FormatTile: View {
     @State private var focusPoint: CGPoint?
     @State private var pressStart: Date?
     /// The current touch began on the selfie window: it drags the window instead of focusing.
-    @State private var draggingSelfie = false
+    @State private var grab: CameraModel.OverlayGrab = .none
 
     private var cornerRadius: CGFloat { fullBleed ? 0 : (compact ? 10 : 16) }
 
@@ -112,19 +112,24 @@ struct FormatTile: View {
                 .onChanged { value in
                     if pressStart == nil {
                         pressStart = Date()
-                        draggingSelfie = model.overlayContains(contentPoint(value.startLocation, in: geo.size), in: kind)
+                        grab = model.overlayGrab(at: contentPoint(value.startLocation, in: geo.size), in: kind)
                     }
-                    if draggingSelfie {
-                        model.moveOverlay(to: contentPoint(value.location, in: geo.size), done: false)
+                    let point = contentPoint(value.location, in: geo.size)
+                    switch grab {
+                    case .move: model.moveOverlay(to: point, done: false)
+                    case .resize: model.resizeOverlay(to: point, in: kind, done: false)
+                    case .none: break
                     }
                 }
                 .onEnded { value in
                     let held = Date().timeIntervalSince(pressStart ?? Date())
                     pressStart = nil
                     let moved = hypot(value.translation.width, value.translation.height) >= 12
-                    if draggingSelfie {
-                        draggingSelfie = false
-                        model.moveOverlay(to: contentPoint(value.location, in: geo.size), done: true)
+                    if grab != .none {
+                        let point = contentPoint(value.location, in: geo.size)
+                        if grab == .move { model.moveOverlay(to: point, done: true) }
+                        else { model.resizeOverlay(to: point, in: kind, done: true) }
+                        grab = .none
                         if moved { return }
                     }
                     guard enabled, !moved else { return }
@@ -206,7 +211,13 @@ struct PreviewStage: View {
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                if onlyFull {
+                if model.state.dualActive {
+                    // Front + back is one clean upright picture: no other formats on screen.
+                    if model.config.layout == .split {
+                        FormatTile(kind: .vertical, model: model, motion: motion)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                } else if onlyFull {
                     FormatTile(kind: .full, model: model, motion: motion)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if model.config.layout == .split {
@@ -385,7 +396,7 @@ struct FullScreenPrimary: View {
     var body: some View {
         GeometryReader { geo in
             let landscape = geo.size.width > geo.size.height
-            let primary = model.config.pipMain(landscape: landscape)
+            let primary = model.state.dualActive ? .vertical : model.config.pipMain(landscape: landscape)
             // Fill edge to edge when the format matches the screen's shape; otherwise show it whole.
             let fills = (primary == .vertical) != landscape
             Group {

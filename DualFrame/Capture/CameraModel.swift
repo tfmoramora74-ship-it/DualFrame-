@@ -284,7 +284,8 @@ final class CameraModel: ObservableObject {
     /// Degrees that turn the delivered buffer upright for files and previews.
     var captureRotation: Double {
         if let lockedRotation { return lockedRotation }
-        let held = config.followDeviceRotation ? deviceRotation : 90
+        // Front + back is portrait-only.
+        let held = config.followDeviceRotation && !state.dualActive ? deviceRotation : 90
         // The front buffer already arrives turned upright for portrait (90°) by the connection.
         return isFront ? held - 90 : held
     }
@@ -370,9 +371,12 @@ final class CameraModel: ObservableObject {
     }
 
     private var hasOutputs: Bool {
-        if config.outputs.isEmpty { toast = "Ligue pelo menos um formato." }
-        return !config.outputs.isEmpty
+        if activeOutputs.isEmpty { toast = "Ligue pelo menos um formato." }
+        return !activeOutputs.isEmpty
     }
+
+    /// What actually gets recorded: front + back is a single upright (9:16) picture.
+    var activeOutputs: [OutputKind] { state.dualActive ? [.vertical] : config.outputs }
 
     func startRecording() {
         guard !isRecording, !isBusy, hasOutputs else { return }
@@ -381,7 +385,7 @@ final class CameraModel: ObservableObject {
         lockedRotation = rotation
         var resolutions: [OutputKind: OutputResolution] = [:]
         for kind in OutputKind.allCases { resolutions[kind] = config.resolution(for: kind) }
-        let take = PendingTake(outputs: config.outputs, resolutions: resolutions, codec: config.codec,
+        let take = PendingTake(outputs: activeOutputs, resolutions: resolutions, codec: config.codec,
                                quality: config.quality, fps: state.fps, dynamicRange: state.dynamicRange,
                                rotationDegrees: rotation, mirror: isFront && config.mirrorFront,
                                bakeRotation: state.dualActive,
@@ -597,6 +601,7 @@ final class CameraModel: ObservableObject {
 
     func toggleFrontOverlay() {
         guard !isRecording, !isSwitching else { return }
+        isSwitching = true
         var next = config
         next.frontOverlay.toggle()
         if next.frontOverlay {
@@ -607,20 +612,49 @@ final class CameraModel: ObservableObject {
         UISelectionFeedbackGenerator().selectionChanged()
     }
 
-    /// Is `point` (0...1 in the upright tile of `kind`) on the selfie window?
-    func overlayContains(_ point: CGPoint, in kind: OutputKind) -> Bool {
-        guard state.dualActive else { return false }
+    enum OverlayGrab { case none, move, resize }
+
+    private func overlayCanvas(_ kind: OutputKind) -> (canvas: CGSize, rect: CGRect) {
         let canvas = CGSize(width: CGFloat(kind.uprightAspect) * 1000, height: 1000)
         let frontAspect: CGFloat = CropMath.normalizedRotation(frontRotation) % 180 == 0 ? 3.0 / 4.0 : 4.0 / 3.0
-        let rect = OverlayCompositor.windowRect(spec: config.overlay, canvas: canvas, frontAspect: frontAspect)
-        // A little slack around the window makes it easy to grab.
-        return rect.insetBy(dx: -40, dy: -40).contains(CGPoint(x: point.x * canvas.width, y: point.y * canvas.height))
+        let rect = OverlayCompositor.windowRect(spec: draggingOverlay ?? config.overlay, canvas: canvas,
+                                                frontAspect: frontAspect)
+        return (canvas, rect)
+    }
+
+    /// What a touch at `point` (0...1 in the upright tile of `kind`) grabs: the window's edge
+    /// resizes it (like a desktop window), its inside moves it.
+    func overlayGrab(at point: CGPoint, in kind: OutputKind) -> OverlayGrab {
+        guard state.dualActive else { return .none }
+        let (canvas, rect) = overlayCanvas(kind)
+        let p = CGPoint(x: point.x * canvas.width, y: point.y * canvas.height)
+        let band = max(36, min(rect.width, rect.height) * 0.22)
+        guard rect.insetBy(dx: -band / 2, dy: -band / 2).contains(p) else { return .none }
+        let inner = rect.insetBy(dx: band / 2, dy: band / 2)
+        return inner.width > 0 && inner.height > 0 && inner.contains(p) ? .move : .resize
     }
 
     /// Drag the selfie window; `point` is 0...1 in the upright tile. `done` saves the position.
     func moveOverlay(to point: CGPoint, done: Bool) {
-        var spec = config.overlay
+        var spec = draggingOverlay ?? config.overlay
         spec.center = CGPoint(x: min(max(point.x, 0), 1), y: min(max(point.y, 0), 1))
+        commitOverlay(spec, done: done)
+    }
+
+    /// Resize from the edge: the window keeps its centre and grows/shrinks to reach the finger.
+    func resizeOverlay(to point: CGPoint, in kind: OutputKind, done: Bool) {
+        var spec = draggingOverlay ?? config.overlay
+        let (canvas, rect) = overlayCanvas(kind)
+        let p = CGPoint(x: point.x * canvas.width, y: point.y * canvas.height)
+        let halfWidth = abs(p.x - rect.midX)
+        let halfHeightAsWidth = abs(p.y - rect.midY) * (rect.width / max(rect.height, 1))
+        let width = 2 * max(halfWidth, halfHeightAsWidth)
+        let fraction = width / min(canvas.width, canvas.height)
+        spec.fraction = min(max(fraction, OverlaySpec.fractionRange.lowerBound), OverlaySpec.fractionRange.upperBound)
+        commitOverlay(spec, done: done)
+    }
+
+    private func commitOverlay(_ spec: OverlaySpec, done: Bool) {
         if done {
             draggingOverlay = nil
             config.overlay = spec

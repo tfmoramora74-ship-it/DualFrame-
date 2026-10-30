@@ -73,10 +73,12 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
     let sessionQueue = DispatchQueue(label: "dualframe.session")
     private let outputQueue = DispatchQueue(label: "dualframe.output", qos: .userInitiated)
     private let photoQueue = DispatchQueue(label: "dualframe.photo", qos: .userInitiated)
-    private let videoOutput = AVCaptureVideoDataOutput()
-    private let audioOutput = AVCaptureAudioDataOutput()
-    private let photoOutput = AVCapturePhotoOutput()
-    private let frontOutput = AVCaptureVideoDataOutput()
+    // Outputs are replaced together with the session: iOS does not reliably accept an output
+    // that already belonged to another (configured) session — reusing them crashed the app.
+    private var videoOutput = AVCaptureVideoDataOutput()
+    private var audioOutput = AVCaptureAudioDataOutput()
+    private var photoOutput = AVCapturePhotoOutput()
+    private var frontOutput = AVCaptureVideoDataOutput()
     private var frontInput: AVCaptureDeviceInput?
     /// Newest selfie frame (front + back); only the latest is kept so the pool keeps flowing.
     private var latestFront: CVPixelBuffer?
@@ -206,7 +208,8 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
         let width = CVPixelBufferGetWidth(base), height = CVPixelBufferGetHeight(base)
         let source = FrameRenderer.source(base, colorManaged: true)
         let effects = thermalLoad == .normal
-        let selfie = frontOverlay(spec: spec)
+        var selfie = frontOverlay(spec: spec)
+        selfie?.showGrip = true
 
         for (kind, entries) in sinks {
             let crop = CropMath.region(kind: kind, width: width, height: height, verticalIsBufferX: verticalIsBufferX)
@@ -575,17 +578,27 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
     private func rebuildSession(multiCam: Bool) {
         let old = session
         if old.isRunning { old.stopRunning() }
+        // Release the cameras and microphone; the old outputs are simply dropped with the old session.
         old.beginConfiguration()
         old.inputs.forEach { old.removeInput($0) }
-        old.outputs.forEach { old.removeOutput($0) }
         old.commitConfiguration()
+        // Swap on the output queue so no frame callback is mid-flight comparing against them.
+        outputQueue.sync {
+            videoOutput.setSampleBufferDelegate(nil, queue: nil)
+            frontOutput.setSampleBufferDelegate(nil, queue: nil)
+            audioOutput.setSampleBufferDelegate(nil, queue: nil)
+            videoOutput = AVCaptureVideoDataOutput()
+            audioOutput = AVCaptureAudioDataOutput()
+            photoOutput = AVCapturePhotoOutput()
+            frontOutput = AVCaptureVideoDataOutput()
+            latestFront = nil
+        }
         session = multiCam ? AVCaptureMultiCamSession() : AVCaptureSession()
         videoInput = nil
         audioInput = nil
         frontInput = nil
         outputsAdded = false
         photoOutputAdded = false
-        outputQueue.async { self.latestFront = nil }
     }
 
     private func configureDual(_ config: CaptureConfig, session multi: AVCaptureMultiCamSession) -> SessionState {
@@ -666,28 +679,40 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
         let frontFormats = front.formats
             .filter { $0.isMultiCamSupported && Self.isFourByThree($0) && Self.maxFPS($0) >= fps }
             .sorted { Self.dimensions($0).width < Self.dimensions($1).width }
-        let frontFormat = frontFormats.first { Self.dimensions($0).width >= 1280 } ?? frontFormats.last
         let duration = CMTime(value: 1000, timescale: CMTimeScale(fps * 1000))
+        // Selfie: HD = smallest format ≥ 1280 wide; Máx = largest, stepping down until both fit.
+        let hdFront = frontFormats.first { Self.dimensions($0).width >= 1280 } ?? frontFormats.last
+        let frontChoices: [AVCaptureDevice.Format] = config.frontResolution == .hd
+            ? [hdFront].compactMap { $0 }
+            : Array(frontFormats.reversed())
 
-        if let frontFormat, (try? front.lockForConfiguration()) != nil {
-            front.activeFormat = frontFormat
-            front.activeVideoMinFrameDuration = duration
-            front.activeVideoMaxFrameDuration = duration
-            if front.isExposureModeSupported(.continuousAutoExposure) { front.exposureMode = .continuousAutoExposure }
-            front.unlockForConfiguration()
+        func apply(_ format: AVCaptureDevice.Format, to device: AVCaptureDevice) {
+            guard (try? device.lockForConfiguration()) != nil else { return }
+            device.activeFormat = format
+            device.activeVideoMinFrameDuration = duration
+            device.activeVideoMaxFrameDuration = duration
+            if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+            device.videoZoomFactor = 1
+            device.unlockForConfiguration()
         }
-        for format in backFormats {
-            guard (try? back.lockForConfiguration()) != nil else { break }
-            back.activeFormat = format
-            back.activeVideoMinFrameDuration = duration
-            back.activeVideoMaxFrameDuration = duration
-            if back.isFocusModeSupported(.continuousAutoFocus) { back.focusMode = .continuousAutoFocus }
-            if back.isExposureModeSupported(.continuousAutoExposure) { back.exposureMode = .continuousAutoExposure }
-            back.videoZoomFactor = 1
-            back.unlockForConfiguration()
-            state.activeFormat = Self.info(format)
-            if multi.hardwareCost <= 1 { break }
+        // The back camera has priority: for each back format (largest first) try the selfie
+        // formats until the pair fits the shared hardware budget.
+        var fitted = false
+        search: for backFormat in backFormats {
+            apply(backFormat, to: back)
+            state.activeFormat = Self.info(backFormat)
+            for frontFormat in frontChoices {
+                apply(frontFormat, to: front)
+                if multi.hardwareCost <= 1 {
+                    fitted = true
+                    let d = Self.dimensions(frontFormat)
+                    state.notes.append("Selfie em \(d.width)×\(d.height).")
+                    break search
+                }
+            }
         }
+        if !fitted, let smallest = frontFormats.first { apply(smallest, to: front) }
         state.fps = fps
         if config.fps > 30 { state.notes.append("Com as duas câmeras o limite é 30 fps.") }
         if config.dynamicRange != .sdr { state.notes.append("Com as duas câmeras a gravação é em SDR.") }

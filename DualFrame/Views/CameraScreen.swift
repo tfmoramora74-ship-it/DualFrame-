@@ -79,7 +79,11 @@ struct CameraScreen: View {
             await model.start()
         }
         .onChange(of: model.config.followDeviceRotation) { _, rotates in
-            OrientationLock.apply(rotates: rotates)
+            OrientationLock.apply(rotates: rotates && !model.state.dualActive)
+        }
+        // Front + back is portrait-only.
+        .onChange(of: model.state.dualActive) { _, dual in
+            OrientationLock.apply(rotates: model.config.followDeviceRotation && !dual)
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -604,7 +608,7 @@ struct FormatPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            ForEach(OutputKind.allCases) { kind in
+            ForEach(model.state.dualActive ? [OutputKind.vertical] : OutputKind.allCases) { kind in
                 row(kind.menuTitle) {
                     let enabled = model.config.isEnabled(kind)
                     if model.config.mode == .video {
@@ -633,9 +637,9 @@ struct FormatPanel: View {
                     option("Off", selected: !model.config.frontOverlay) {
                         if model.config.frontOverlay { model.toggleFrontOverlay() }
                     }
-                    ForEach(OverlaySize.allCases) { size in
-                        option(size.label, selected: model.config.frontOverlay && model.config.overlay.size == size) {
-                            model.config.overlay.size = size
+                    ForEach(FrontResolution.allCases) { resolution in
+                        option(resolution.label, selected: model.config.frontOverlay && model.config.frontResolution == resolution) {
+                            model.config.frontResolution = resolution
                             if !model.config.frontOverlay { model.toggleFrontOverlay() }
                         }
                     }
@@ -648,7 +652,7 @@ struct FormatPanel: View {
                             }
                         }
                     }
-                    Text("Frente + trás: a selfie é gravada dentro do mesmo arquivo. Arraste a janela na prévia para posicionar. Limite: 30 fps, SDR.")
+                    Text("Frente + trás grava só o vertical, com a selfie dentro do mesmo arquivo. Arraste o meio da janela para mover e a borda (ou o ponto branco) para redimensionar. Com duas câmeras o iPhone limita a 30 fps, SDR e sem 4K.")
                         .font(.system(size: 11)).foregroundStyle(.white.opacity(0.55))
                 }
                 row("PRIORIDADE") {

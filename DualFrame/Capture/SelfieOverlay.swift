@@ -6,49 +6,54 @@ enum OverlayShape: String, Codable, CaseIterable, Identifiable {
     var label: String { self == .rounded ? "Arredondada" : "Círculo" }
 }
 
-enum OverlaySize: String, Codable, CaseIterable, Identifiable {
-    case small, medium, large
+/// Resolution of the selfie camera in front + back mode.
+enum FrontResolution: String, Codable, CaseIterable, Identifiable {
+    case hd, max
     var id: String { rawValue }
-    var label: String {
-        switch self {
-        case .small: return "P"
-        case .medium: return "M"
-        case .large: return "G"
-        }
-    }
-    /// Window width as a fraction of the output's short side.
-    var fraction: CGFloat {
-        switch self {
-        case .small: return 0.26
-        case .medium: return 0.34
-        case .large: return 0.46
-        }
-    }
+    var label: String { self == .hd ? "HD" : "Máx" }
 }
 
 /// Where and how the selfie window is burned into the back-camera picture.
-/// `center` is normalized (0...1, top-left origin) in the upright output, so the same
-/// placement works for the 9:16, 16:9 and 4:3 files.
+/// `center` is normalized (0...1, top-left origin) in the upright output; `fraction` is the
+/// window width as a share of the output's short side (resized by dragging its edge).
 struct OverlaySpec: Codable, Equatable {
     var center = CGPoint(x: 0.76, y: 0.22)
-    var size: OverlaySize = .medium
+    var fraction: CGFloat = 0.34
     var shape: OverlayShape = .rounded
+
+    static let fractionRange: ClosedRange<CGFloat> = 0.14...0.9
+
+    init() {}
+
+    // Tolerant decoding: settings saved by older versions (which had fixed sizes) still load.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        center = try container.decodeIfPresent(CGPoint.self, forKey: .center) ?? center
+        fraction = try container.decodeIfPresent(CGFloat.self, forKey: .fraction) ?? fraction
+        shape = try container.decodeIfPresent(OverlayShape.self, forKey: .shape) ?? shape
+    }
 }
 
 /// One selfie frame ready to composite: already upright and mirrored as wanted.
 struct FrontOverlay {
     let image: CIImage
     let spec: OverlaySpec
+    /// Previews only: draw a resize grip on the window's corner.
+    var showGrip = false
 }
 
 enum OverlayCompositor {
     /// Window rectangle in a canvas of `canvas` size, top-left origin (UIKit-style).
     static func windowRect(spec: OverlaySpec, canvas: CGSize, frontAspect: CGFloat) -> CGRect {
-        let width = min(canvas.width, canvas.height) * spec.size.fraction
-        let height = spec.shape == .circle ? width : width / max(frontAspect, 0.1)
+        let fraction = min(max(spec.fraction, OverlaySpec.fractionRange.lowerBound), OverlaySpec.fractionRange.upperBound)
+        var width = min(canvas.width, canvas.height) * fraction
+        var height = spec.shape == .circle ? width : width / max(frontAspect, 0.1)
+        // Never larger than the picture itself.
+        let fit = min(1, canvas.width / width, canvas.height / height)
+        width *= fit
+        height *= fit
         var x = spec.center.x * canvas.width - width / 2
         var y = spec.center.y * canvas.height - height / 2
-        // Keep the whole window inside the picture.
         x = min(max(x, 0), canvas.width - width)
         y = min(max(y, 0), canvas.height - height)
         return CGRect(x: x, y: y, width: width, height: height)
@@ -75,18 +80,28 @@ enum OverlayCompositor {
             .cropped(to: rect)
 
         let radius = overlay.spec.shape == .circle ? rect.width / 2 : rect.width * 0.12
-        let border = max(2, rect.width * 0.018)
+        // A hairline edge: just enough to separate the selfie from the background.
+        let border = max(1, rect.width * 0.006)
         let outline = roundedRect(rect.insetBy(dx: -border, dy: -border), radius: radius + border,
-                                  color: CIColor(red: 1, green: 1, blue: 1, alpha: 0.9))
+                                  color: CIColor(red: 1, green: 1, blue: 1, alpha: 0.75))
         let mask = roundedRect(rect, radius: radius, color: .white)
 
-        let framed = outline.composited(over: base)
-        return placed
+        var result = placed
             .applyingFilter("CIBlendWithMask", parameters: [
-                kCIInputBackgroundImageKey: framed,
+                kCIInputBackgroundImageKey: outline.composited(over: base),
                 kCIInputMaskImageKey: mask,
             ])
-            .cropped(to: CGRect(origin: .zero, size: size))
+        if overlay.showGrip {
+            // Resize grip on the bottom-right corner (bottom-right in UIKit = bottom-right here too).
+            let grip = max(10, min(size.width, size.height) * 0.035)
+            let center = overlay.spec.shape == .circle
+                ? CGPoint(x: rect.midX + rect.width * 0.354, y: rect.midY - rect.height * 0.354)
+                : CGPoint(x: rect.maxX - radius * 0.3, y: rect.minY + radius * 0.3)
+            let dot = roundedRect(CGRect(x: center.x - grip / 2, y: center.y - grip / 2, width: grip, height: grip),
+                                  radius: grip / 2, color: CIColor(red: 1, green: 1, blue: 1, alpha: 0.95))
+            result = dot.composited(over: result)
+        }
+        return result.cropped(to: CGRect(origin: .zero, size: size))
     }
 
     private static func roundedRect(_ rect: CGRect, radius: CGFloat, color: CIColor) -> CIImage {

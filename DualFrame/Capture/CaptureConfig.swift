@@ -229,6 +229,7 @@ struct CaptureConfig: Codable, Equatable {
     /// Front + back: the selfie camera is burned into the back-camera files as a movable window.
     var frontOverlay = false
     var overlay = OverlaySpec()
+    var frontResolution: FrontResolution = .max
     var pipLarge = false
 
     var showGrid = false
@@ -284,7 +285,7 @@ struct CaptureConfig: Codable, Equatable {
 
     /// Fields that require rebuilding the capture session when changed.
     var sessionKey: String {
-        "\(frontOverlay && mode == .video)|\(mode.rawValue)|\(lens.rawValue)|\(requiredFormatWidth)|\(preferStabilization)|\(fps)|\(dynamicRange.rawValue)|\(stabilization.rawValue)|\(formatOverride ?? "-")"
+        "\(frontOverlay && mode == .video)|\(frontResolution.rawValue)|\(mode.rawValue)|\(lens.rawValue)|\(requiredFormatWidth)|\(preferStabilization)|\(fps)|\(dynamicRange.rawValue)|\(stabilization.rawValue)|\(formatOverride ?? "-")"
     }
 
     static let storageKey = "captureConfig.v5"
