@@ -2,6 +2,9 @@
 
 Todas as versões do DualFrame. O IPA mais recente está sempre na release [`latest`](https://github.com/tfmoramora74-ship-it/DualFrame-/releases/tag/latest).
 
+## 1.10
+- **Cores do frente + trás corrigidas de vez:** as duas câmeras ficam travadas em sRGB (o iOS ligava o Display P3 sozinho) e todo arquivo agora declara a cor exata que o sensor entregou, em qualquer modo.
+
 ## 1.9
 - **Frente + trás:** cores corrigidas (os valores das duas câmeras passam sem conversão) e gravação fluida: a selfie chega numa fila própria, o 9:16 é gravado em HD exato a partir do sensor 1920×1440 e a prévia reaproveita o quadro gravado.
 - Novo **diagnóstico de desempenho** (Ajustes › Sobre): fps reais, tempo de processamento e quadros perdidos na prévia.

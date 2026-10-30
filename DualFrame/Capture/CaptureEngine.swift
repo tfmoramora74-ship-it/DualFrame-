@@ -664,6 +664,9 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
         state.dualActive = true
         multi.beginConfiguration()
         defer { multi.commitConfiguration() }
+        // Left on, iOS switches both cameras to Display P3; the files are SDR Rec.709, so the
+        // colours came out oversaturated and dark. Keep both cameras in sRGB like single-camera mode.
+        multi.automaticallyConfiguresCaptureDeviceForWideColor = false
 
         let backLens: LensChoice = (config.lens == .front || config.lens == .auto) ? .wide : config.lens
         guard let back = Self.device(for: backLens),
@@ -758,6 +761,7 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
             device.activeVideoMaxFrameDuration = duration
             if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
             if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+            if format.supportedColorSpaces.contains(.sRGB) { device.activeColorSpace = .sRGB }
             device.videoZoomFactor = 1
             device.unlockForConfiguration()
         }
@@ -1202,7 +1206,7 @@ extension CaptureEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                 pendingTake = nil
                 do {
                     let audioSettings = audioOutput.recommendedAudioSettingsForAssetWriter(writingTo: .mov)
-                    writer = try TakeWriter(pending: take, bufferWidth: width, bufferHeight: height,
+                    writer = try TakeWriter(pending: take, source: pixelBuffer, bufferWidth: width, bufferHeight: height,
                                             audioSettings: audioInput == nil ? nil : audioSettings,
                                             renderer: renderer)
                 } catch {

@@ -2,8 +2,10 @@ import AVFoundation
 import VideoToolbox
 
 enum EncoderSettings {
+    /// `sourceTags`: the colour description carried by the sensor's own buffers. When present it
+    /// is what the file declares, so the file always says exactly what its pixels are.
     static func video(size: CGSize, codec: VideoCodecChoice, fps: Double, range: DynamicRange,
-                      quality: BitrateQuality) -> [String: Any] {
+                      quality: BitrateQuality, sourceTags: [String: Any]? = nil) -> [String: Any] {
         let tenBit = range != .sdr
         // 10-bit H.264 does not exist on iPhone; HDR and Log always go to HEVC or ProRes.
         let codec: VideoCodecChoice = (codec == .h264 && tenBit) ? .hevc : codec
@@ -13,7 +15,11 @@ enum EncoderSettings {
             AVVideoHeightKey: Int(size.height),
         ]
         // Log: no explicit tags, the encoder keeps the Apple Log tags carried by the buffers.
-        if let color = colorProperties(range) { settings[AVVideoColorPropertiesKey] = color }
+        if range != .log, let sourceTags {
+            settings[AVVideoColorPropertiesKey] = sourceTags
+        } else if let color = colorProperties(range) {
+            settings[AVVideoColorPropertiesKey] = color
+        }
 
         let pixelsPerSecond = Double(size.width * size.height) * fps
         switch codec {
@@ -39,6 +45,29 @@ enum EncoderSettings {
             settings[AVVideoCodecKey] = AVVideoCodecType.proRes422
         }
         return settings
+    }
+
+    /// Primaries / transfer function / matrix attached to a capture buffer, in AVVideo terms
+    /// (the CoreVideo and AVFoundation constants share the same string values).
+    static func colorTags(of buffer: CVPixelBuffer) -> [String: Any]? {
+        func tag(_ key: CFString) -> String? {
+            CVBufferCopyAttachment(buffer, key, nil) as? String
+        }
+        // Only values the encoder accepts; anything else falls back to the defaults.
+        let primariesOK: Set<String> = [AVVideoColorPrimaries_ITU_R_709_2, AVVideoColorPrimaries_P3_D65,
+                                        AVVideoColorPrimaries_ITU_R_2020, AVVideoColorPrimaries_SMPTE_C]
+        let transferOK: Set<String> = [AVVideoTransferFunction_ITU_R_709_2, AVVideoTransferFunction_ITU_R_2100_HLG,
+                                       AVVideoTransferFunction_SMPTE_ST_2084_PQ]
+        let matrixOK: Set<String> = [AVVideoYCbCrMatrix_ITU_R_709_2, AVVideoYCbCrMatrix_ITU_R_601_4,
+                                     AVVideoYCbCrMatrix_ITU_R_2020]
+        guard let primaries = tag(kCVImageBufferColorPrimariesKey), primariesOK.contains(primaries),
+              let transfer = tag(kCVImageBufferTransferFunctionKey), transferOK.contains(transfer),
+              let matrix = tag(kCVImageBufferYCbCrMatrixKey), matrixOK.contains(matrix) else { return nil }
+        return [
+            AVVideoColorPrimariesKey: primaries,
+            AVVideoTransferFunctionKey: transfer,
+            AVVideoYCbCrMatrixKey: matrix,
+        ]
     }
 
     static func colorProperties(_ range: DynamicRange) -> [String: Any]? {
@@ -93,8 +122,8 @@ final class TakeWriter {
     private var startTime: CMTime = .invalid
     private(set) var droppedFrames = 0
 
-    init(pending: PendingTake, bufferWidth: Int, bufferHeight: Int, audioSettings: [String: Any]?,
-         renderer: FrameRenderer) throws {
+    init(pending: PendingTake, source: CVPixelBuffer, bufferWidth: Int, bufferHeight: Int,
+         audioSettings: [String: Any]?, renderer: FrameRenderer) throws {
         folder = pending.folder
         self.renderer = renderer
         range = pending.dynamicRange
@@ -113,7 +142,8 @@ final class TakeWriter {
             let encodedSize = pending.bakeRotation
                 ? CropMath.uprightSize(plan.size, rotationDegrees: pending.rotationDegrees) : plan.size
             let videoSettings = EncoderSettings.video(size: encodedSize, codec: pending.codec, fps: pending.fps,
-                                                      range: pending.dynamicRange, quality: pending.quality)
+                                                      range: pending.dynamicRange, quality: pending.quality,
+                                                      sourceTags: EncoderSettings.colorTags(of: source))
             let video = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
             video.expectsMediaDataInRealTime = true
             video.transform = pending.bakeRotation ? .identity : plan.transform
