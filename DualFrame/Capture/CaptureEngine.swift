@@ -33,6 +33,8 @@ struct SessionState {
     var stabilizationRequested = "Desligada"
     var rawAvailable = false
     var appleLogAvailable = false
+    /// Front + back capture is running.
+    var dualActive = false
     var notes: [String] = []
 }
 
@@ -44,6 +46,10 @@ struct PreviewSpec {
     var peaking = false
     /// A sheet covers the camera: skip preview rendering entirely.
     var paused = false
+    /// Front + back: where the selfie window goes, and how to turn the front frames upright.
+    var overlay: OverlaySpec?
+    var frontRotation: Double = 0
+    var frontMirror = true
 }
 
 private final class WeakLayer {
@@ -61,13 +67,19 @@ enum ThermalLoad: Int {
 /// Owns the AVCaptureSession and the capture pipeline. Not main-actor bound:
 /// configuration runs on `sessionQueue`, frames arrive on `outputQueue`.
 final class CaptureEngine: NSObject, @unchecked Sendable {
-    let session = AVCaptureSession()
+    /// Swapped for an AVCaptureMultiCamSession while front + back is on.
+    private(set) var session = AVCaptureSession()
+    private var shouldRun = false
     let sessionQueue = DispatchQueue(label: "dualframe.session")
     private let outputQueue = DispatchQueue(label: "dualframe.output", qos: .userInitiated)
     private let photoQueue = DispatchQueue(label: "dualframe.photo", qos: .userInitiated)
     private let videoOutput = AVCaptureVideoDataOutput()
     private let audioOutput = AVCaptureAudioDataOutput()
     private let photoOutput = AVCapturePhotoOutput()
+    private let frontOutput = AVCaptureVideoDataOutput()
+    private var frontInput: AVCaptureDeviceInput?
+    /// Newest selfie frame (front + back); only the latest is kept so the pool keeps flowing.
+    private var latestFront: CVPixelBuffer?
     private var videoInput: AVCaptureDeviceInput?
     private var audioInput: AVCaptureDeviceInput?
     private var outputsAdded = false
@@ -111,13 +123,24 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
         super.init()
         let center = NotificationCenter.default
         center.addObserver(self, selector: #selector(sessionProblem(_:)), name: AVCaptureSession.runtimeErrorNotification,
-                           object: session)
+                           object: nil)
         center.addObserver(self, selector: #selector(sessionProblem(_:)),
-                           name: AVCaptureSession.interruptionEndedNotification, object: session)
+                           name: AVCaptureSession.interruptionEndedNotification, object: nil)
     }
 
     @objc private func sessionProblem(_ note: Notification) {
-        sessionQueue.async { self.restart() }
+        sessionQueue.async {
+            guard (note.object as AnyObject?) === self.session else { return }
+            self.restart()
+        }
+    }
+
+    /// Configures, then (re)starts the session if the camera is supposed to be on.
+    func configureAndRun(_ config: CaptureConfig, start: Bool) -> SessionState {
+        if start { shouldRun = true }
+        let state = configure(config)
+        if shouldRun, !session.isRunning { session.startRunning() }
+        return state
     }
 
     /// Recovers a session that stopped delivering frames (runtime error, interruption, stuck reconfiguration).
@@ -183,6 +206,7 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
         let width = CVPixelBufferGetWidth(base), height = CVPixelBufferGetHeight(base)
         let source = FrameRenderer.source(base, colorManaged: true)
         let effects = thermalLoad == .normal
+        let selfie = frontOverlay(spec: spec)
 
         for (kind, entries) in sinks {
             let crop = CropMath.region(kind: kind, width: width, height: height, verticalIsBufferX: verticalIsBufferX)
@@ -193,6 +217,7 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
             let size = CGSize(width: CropMath.even(upright.width * scale), height: CropMath.even(upright.height * scale))
             var image = renderer.image(from: source, crop: crop, rotation: rotation, mirror: spec.mirror, size: size)
             if effects, spec.peaking { image = Self.peaking(image) }
+            image = OverlayCompositor.compose(image, size: size, overlay: selfie)
             if effects, spec.zebra { image = Self.zebra(image) }
             guard let frame = renderer.render(image, size: size, format: kCVPixelFormatType_32BGRA,
                                               colorSpace: FrameRenderer.displaySpace, tagsFrom: nil, preview: true),
@@ -323,7 +348,18 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
 
     func configure(_ config: CaptureConfig) -> SessionState {
         outputQueue.sync { awaitingFirstFrame = true }
+        let wantsDual = config.frontOverlay && config.mode == .video && AVCaptureMultiCamSession.isMultiCamSupported
+        if wantsDual != (session is AVCaptureMultiCamSession) {
+            rebuildSession(multiCam: wantsDual)
+        }
+        if wantsDual, let multi = session as? AVCaptureMultiCamSession {
+            return configureDual(config, session: multi)
+        }
+
         var state = SessionState()
+        if config.frontOverlay && config.mode == .video {
+            state.notes.append("Este iPhone não grava com as duas câmeras ao mesmo tempo.")
+        }
         session.beginConfiguration()
         defer { session.commitConfiguration() }
 
@@ -523,11 +559,174 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
     }
 
     func start() {
+        shouldRun = true
         if !session.isRunning { session.startRunning() }
     }
 
     func stop() {
+        shouldRun = false
         if session.isRunning { session.stopRunning() }
+    }
+
+    // MARK: Front + back (multi-cam)
+
+    /// A session can't change type, so switching to/from multi-cam moves every input and output
+    /// to a fresh session object.
+    private func rebuildSession(multiCam: Bool) {
+        let old = session
+        if old.isRunning { old.stopRunning() }
+        old.beginConfiguration()
+        old.inputs.forEach { old.removeInput($0) }
+        old.outputs.forEach { old.removeOutput($0) }
+        old.commitConfiguration()
+        session = multiCam ? AVCaptureMultiCamSession() : AVCaptureSession()
+        videoInput = nil
+        audioInput = nil
+        frontInput = nil
+        outputsAdded = false
+        photoOutputAdded = false
+        outputQueue.async { self.latestFront = nil }
+    }
+
+    private func configureDual(_ config: CaptureConfig, session multi: AVCaptureMultiCamSession) -> SessionState {
+        var state = SessionState()
+        state.dualActive = true
+        multi.beginConfiguration()
+        defer { multi.commitConfiguration() }
+
+        let backLens: LensChoice = (config.lens == .front || config.lens == .auto) ? .wide : config.lens
+        guard let back = Self.device(for: backLens),
+              let front = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else {
+            state.notes.append("Câmeras não disponíveis para frente + trás.")
+            return state
+        }
+
+        // Inputs without automatic connections: multi-cam needs explicit port → output wiring.
+        func attach(_ device: AVCaptureDevice, current: AVCaptureDeviceInput?) -> AVCaptureDeviceInput? {
+            if let current, current.device.uniqueID == device.uniqueID { return current }
+            if let current { multi.removeInput(current) }
+            guard let input = try? AVCaptureDeviceInput(device: device), multi.canAddInput(input) else { return nil }
+            multi.addInputWithNoConnections(input)
+            return input
+        }
+        videoInput = attach(back, current: videoInput)
+        frontInput = attach(front, current: frontInput)
+        if audioInput == nil, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
+           let mic = AVCaptureDevice.default(for: .audio) {
+            audioInput = attach(mic, current: nil)
+        }
+        guard let backInput = videoInput, let selfieInput = frontInput else {
+            state.notes.append("Não foi possível abrir as duas câmeras.")
+            return state
+        }
+        device = back
+        state.device = back
+        observePressure(of: back)
+
+        if !outputsAdded {
+            videoOutput.alwaysDiscardsLateVideoFrames = true
+            frontOutput.alwaysDiscardsLateVideoFrames = true
+            videoOutput.setSampleBufferDelegate(self, queue: outputQueue)
+            frontOutput.setSampleBufferDelegate(self, queue: outputQueue)
+            audioOutput.setSampleBufferDelegate(self, queue: outputQueue)
+            for output in [videoOutput, frontOutput, audioOutput] as [AVCaptureOutput] where multi.canAddOutput(output) {
+                multi.addOutputWithNoConnections(output)
+            }
+            outputsAdded = true
+        }
+
+        func connect(_ input: AVCaptureDeviceInput, _ type: AVMediaType, position: AVCaptureDevice.Position,
+                     to output: AVCaptureOutput) -> AVCaptureConnection? {
+            if let existing = output.connections.first(where: { $0.inputPorts.contains { $0.input === input } }) {
+                return existing
+            }
+            let ports = input.ports(for: type, sourceDeviceType: type == .video ? input.device.deviceType : nil,
+                                    sourceDevicePosition: type == .video ? position : .unspecified)
+            guard let port = ports.first ?? input.ports.first(where: { $0.mediaType == type }) else { return nil }
+            let connection = AVCaptureConnection(inputPorts: [port], output: output)
+            guard multi.canAddConnection(connection) else { return nil }
+            multi.addConnection(connection)
+            return connection
+        }
+        // Drop links to inputs that were replaced (lens change).
+        for output in [videoOutput, frontOutput] as [AVCaptureOutput] {
+            for connection in output.connections where !connection.inputPorts.contains(where: { $0.input === backInput || $0.input === selfieInput }) {
+                multi.removeConnection(connection)
+            }
+        }
+        let backConnection = connect(backInput, .video, position: .back, to: videoOutput)
+        let frontConnection = connect(selfieInput, .video, position: .front, to: frontOutput)
+        if let audioInput { _ = connect(audioInput, .audio, position: .unspecified, to: audioOutput) }
+
+        // Biggest 4:3 back format that fits the shared hardware budget, with a modest selfie format.
+        let fps = min(Double(config.fps), 30)
+        let backFormats = back.formats
+            .filter { $0.isMultiCamSupported && Self.isFourByThree($0) && Self.maxFPS($0) >= fps }
+            .sorted { Self.dimensions($0).width > Self.dimensions($1).width }
+        let frontFormats = front.formats
+            .filter { $0.isMultiCamSupported && Self.isFourByThree($0) && Self.maxFPS($0) >= fps }
+            .sorted { Self.dimensions($0).width < Self.dimensions($1).width }
+        let frontFormat = frontFormats.first { Self.dimensions($0).width >= 1280 } ?? frontFormats.last
+        let duration = CMTime(value: 1000, timescale: CMTimeScale(fps * 1000))
+
+        if let frontFormat, (try? front.lockForConfiguration()) != nil {
+            front.activeFormat = frontFormat
+            front.activeVideoMinFrameDuration = duration
+            front.activeVideoMaxFrameDuration = duration
+            if front.isExposureModeSupported(.continuousAutoExposure) { front.exposureMode = .continuousAutoExposure }
+            front.unlockForConfiguration()
+        }
+        for format in backFormats {
+            guard (try? back.lockForConfiguration()) != nil else { break }
+            back.activeFormat = format
+            back.activeVideoMinFrameDuration = duration
+            back.activeVideoMaxFrameDuration = duration
+            if back.isFocusModeSupported(.continuousAutoFocus) { back.focusMode = .continuousAutoFocus }
+            if back.isExposureModeSupported(.continuousAutoExposure) { back.exposureMode = .continuousAutoExposure }
+            back.videoZoomFactor = 1
+            back.unlockForConfiguration()
+            state.activeFormat = Self.info(format)
+            if multi.hardwareCost <= 1 { break }
+        }
+        state.fps = fps
+        if config.fps > 30 { state.notes.append("Com as duas câmeras o limite é 30 fps.") }
+        if config.dynamicRange != .sdr { state.notes.append("Com as duas câmeras a gravação é em SDR.") }
+        if multi.hardwareCost > 1 { state.notes.append("As duas câmeras passam do limite de hardware deste iPhone.") }
+
+        for output in [videoOutput, frontOutput] {
+            if output.availableVideoPixelFormatTypes.contains(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+                output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
+            }
+        }
+        if let backConnection {
+            if backConnection.isVideoRotationAngleSupported(0) { backConnection.videoRotationAngle = 0 }
+            state.stabilizationRequested = applyStabilization(config.stabilization, connection: backConnection,
+                                                              format: back.activeFormat)
+        }
+        if let frontConnection {
+            // Selfie frames arrive upright for a phone held upright; mirroring is applied when compositing.
+            if frontConnection.isVideoRotationAngleSupported(90) { frontConnection.videoRotationAngle = 90 }
+            if frontConnection.isVideoMirroringSupported {
+                frontConnection.automaticallyAdjustsVideoMirroring = false
+                frontConnection.isVideoMirrored = false
+            }
+        }
+        state.formats = []
+        return state
+    }
+
+    /// The newest selfie frame, upright for the way the phone is held, as a compositing layer.
+    private func frontOverlay(spec: PreviewSpec) -> FrontOverlay? {
+        guard let overlay = spec.overlay, let front = latestFront else { return nil }
+        var image = CIImage(cvPixelBuffer: front)
+        if let orientation = FrameRenderer.orientation(for: CropMath.normalizedRotation(spec.frontRotation)) {
+            image = image.oriented(orientation)
+        }
+        image = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
+        if spec.frontMirror {
+            image = image.transformed(by: CGAffineTransform(scaleX: -1, y: 1).translatedBy(x: -image.extent.width, y: 0))
+        }
+        return FrontOverlay(image: image, spec: overlay)
     }
 
     // MARK: Recording
@@ -880,6 +1079,10 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
 extension CaptureEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
+        if output === frontOutput {
+            latestFront = CMSampleBufferGetImageBuffer(sampleBuffer)
+            return
+        }
         if output === videoOutput {
             guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
             let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -904,7 +1107,12 @@ extension CaptureEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                     onError?(error.localizedDescription)
                 }
             }
-            writer?.appendVideo(sampleBuffer, pixelBuffer: pixelBuffer)
+            if let writer {
+                lock.lock()
+                let spec = previewSpec
+                lock.unlock()
+                writer.appendVideo(sampleBuffer, pixelBuffer: pixelBuffer, overlay: frontOverlay(spec: spec))
+            }
             if stack != nil { stackFrame(pixelBuffer, time: time) }
             if burst != nil { collectBurst(pixelBuffer) }
             pushPreviews(pixelBuffer, time: time)

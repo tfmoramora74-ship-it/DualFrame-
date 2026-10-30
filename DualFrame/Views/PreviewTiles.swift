@@ -64,6 +64,8 @@ struct FormatTile: View {
 
     @State private var focusPoint: CGPoint?
     @State private var pressStart: Date?
+    /// The current touch began on the selfie window: it drags the window instead of focusing.
+    @State private var draggingSelfie = false
 
     private var cornerRadius: CGFloat { fullBleed ? 0 : (compact ? 10 : 16) }
 
@@ -104,14 +106,28 @@ struct FormatTile: View {
                 }
             }
             .contentShape(Rectangle())
-            // One gesture for both: a short tap focuses, a press of half a second locks AE/AF.
+            // One gesture for everything: drag the selfie window, tap to focus, hold to lock AE/AF.
             // Compact windows leave touches to their parent (swap / resize).
             .gesture(DragGesture(minimumDistance: 0)
-                .onChanged { _ in if pressStart == nil { pressStart = Date() } }
+                .onChanged { value in
+                    if pressStart == nil {
+                        pressStart = Date()
+                        draggingSelfie = model.overlayContains(contentPoint(value.startLocation, in: geo.size), in: kind)
+                    }
+                    if draggingSelfie {
+                        model.moveOverlay(to: contentPoint(value.location, in: geo.size), done: false)
+                    }
+                }
                 .onEnded { value in
                     let held = Date().timeIntervalSince(pressStart ?? Date())
                     pressStart = nil
-                    guard enabled, hypot(value.translation.width, value.translation.height) < 12 else { return }
+                    let moved = hypot(value.translation.width, value.translation.height) >= 12
+                    if draggingSelfie {
+                        draggingSelfie = false
+                        model.moveOverlay(to: contentPoint(value.location, in: geo.size), done: true)
+                        if moved { return }
+                    }
+                    guard enabled, !moved else { return }
                     let lock = held >= 0.5
                     let point = CGPoint(x: value.location.x / geo.size.width, y: value.location.y / geo.size.height)
                     model.focus(at: contentPoint(value.location, in: geo.size), in: kind, lock: lock)

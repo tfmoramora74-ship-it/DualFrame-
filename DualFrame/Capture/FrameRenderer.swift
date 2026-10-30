@@ -14,6 +14,7 @@ final class FrameRenderer: @unchecked Sendable {
     private let poolLock = NSLock()
 
     static let displaySpace = CGColorSpace(name: CGColorSpace.sRGB)!
+    static let videoSpace = CGColorSpace(name: CGColorSpace.itur_709)!
     static let photoSpace = CGColorSpace(name: CGColorSpace.displayP3)!
     static let linearSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
 

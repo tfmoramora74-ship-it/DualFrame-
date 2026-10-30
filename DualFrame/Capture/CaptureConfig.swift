@@ -226,6 +226,9 @@ struct CaptureConfig: Codable, Equatable {
 
     var layout: PreviewLayout = .split
     var pipPrimary: OutputKind = .vertical
+    /// Front + back: the selfie camera is burned into the back-camera files as a movable window.
+    var frontOverlay = false
+    var overlay = OverlaySpec()
     var pipLarge = false
 
     var showGrid = false
@@ -281,7 +284,7 @@ struct CaptureConfig: Codable, Equatable {
 
     /// Fields that require rebuilding the capture session when changed.
     var sessionKey: String {
-        "\(mode.rawValue)|\(lens.rawValue)|\(requiredFormatWidth)|\(preferStabilization)|\(fps)|\(dynamicRange.rawValue)|\(stabilization.rawValue)|\(formatOverride ?? "-")"
+        "\(frontOverlay && mode == .video)|\(mode.rawValue)|\(lens.rawValue)|\(requiredFormatWidth)|\(preferStabilization)|\(fps)|\(dynamicRange.rawValue)|\(stabilization.rawValue)|\(formatOverride ?? "-")"
     }
 
     static let storageKey = "captureConfig.v5"
@@ -326,6 +329,9 @@ struct PendingTake {
     /// Degrees that turn the delivered buffer upright (0 when the buffer is already upright).
     let rotationDegrees: Double
     let mirror: Bool
+    /// Front + back: pixels are turned upright before encoding so the selfie window can be drawn in
+    /// upright coordinates (files then carry no rotation transform).
+    let bakeRotation: Bool
     let folder: URL
     let baseName: String
 }

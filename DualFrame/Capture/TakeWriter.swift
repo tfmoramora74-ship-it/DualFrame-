@@ -86,6 +86,8 @@ final class TakeWriter {
     private let renderer: FrameRenderer
     private let range: DynamicRange
     private let mirror: Bool
+    private let bake: Bool
+    private let rotation: Int
     private var tracks: [Track] = []
     private var sessionStarted = false
     private var startTime: CMTime = .invalid
@@ -97,6 +99,8 @@ final class TakeWriter {
         self.renderer = renderer
         range = pending.dynamicRange
         mirror = pending.mirror
+        bake = pending.bakeRotation
+        rotation = CropMath.normalizedRotation(pending.rotationDegrees)
         try FileManager.default.createDirectory(at: pending.folder, withIntermediateDirectories: true)
 
         let plans = CropMath.plans(kinds: pending.outputs, resolutions: pending.resolutions,
@@ -106,11 +110,13 @@ final class TakeWriter {
             let url = pending.folder.appendingPathComponent("\(pending.baseName)_\(plan.kind.fileSuffix).mov")
             let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
 
-            let videoSettings = EncoderSettings.video(size: plan.size, codec: pending.codec, fps: pending.fps,
+            let encodedSize = pending.bakeRotation
+                ? CropMath.uprightSize(plan.size, rotationDegrees: pending.rotationDegrees) : plan.size
+            let videoSettings = EncoderSettings.video(size: encodedSize, codec: pending.codec, fps: pending.fps,
                                                       range: pending.dynamicRange, quality: pending.quality)
             let video = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
             video.expectsMediaDataInRealTime = true
-            video.transform = plan.transform
+            video.transform = pending.bakeRotation ? .identity : plan.transform
             guard writer.canAdd(video) else { throw TakeWriterError.cannotAddInput(plan.kind) }
             writer.add(video)
             let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: video, sourcePixelBufferAttributes: nil)
@@ -132,7 +138,7 @@ final class TakeWriter {
         }
     }
 
-    func appendVideo(_ sampleBuffer: CMSampleBuffer, pixelBuffer: CVPixelBuffer) {
+    func appendVideo(_ sampleBuffer: CMSampleBuffer, pixelBuffer: CVPixelBuffer, overlay: FrontOverlay? = nil) {
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if !sessionStarted {
             for track in tracks { track.writer.startSession(atSourceTime: time) }
@@ -146,7 +152,14 @@ final class TakeWriter {
                 continue
             }
             let frame: CVPixelBuffer?
-            if track.plan.isPassthrough && !mirror {
+            if bake {
+                // Front + back: upright pixels with the selfie window drawn in.
+                let size = CropMath.uprightSize(track.plan.size, rotationDegrees: Double(rotation))
+                let image = renderer.image(from: pixelBuffer, crop: track.plan.crop, rotation: rotation,
+                                           mirror: mirror, size: size)
+                frame = renderer.render(OverlayCompositor.compose(image, size: size, overlay: overlay), size: size,
+                                        format: format, colorSpace: FrameRenderer.videoSpace, tagsFrom: pixelBuffer)
+            } else if track.plan.isPassthrough && !mirror {
                 frame = pixelBuffer
             } else {
                 // Encoded values pass through unconverted, so SDR, HLG and Log stay bit-exact.

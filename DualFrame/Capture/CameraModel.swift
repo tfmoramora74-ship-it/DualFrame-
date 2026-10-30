@@ -227,8 +227,7 @@ final class CameraModel: ObservableObject {
         let generation = reconfigureGeneration
         let config = self.config
         engine.sessionQueue.async { [engine] in
-            let newState = engine.configure(config)
-            if startAfter { engine.start() }
+            let newState = engine.configureAndRun(config, start: startAfter)
             Task { @MainActor [weak self] in self?.apply(newState, generation: generation) }
         }
         // Watchdog: if no frame arrives, restart the session instead of leaving a black screen.
@@ -291,9 +290,15 @@ final class CameraModel: ObservableObject {
     }
 
     private func updatePreviewSpec() {
-        engine.setPreviewSpec(PreviewSpec(rotationDegrees: captureRotation, mirror: isFront,
-                                          zebra: config.zebra, peaking: config.focusPeaking,
-                                          paused: previewsPaused))
+        var spec = PreviewSpec(rotationDegrees: captureRotation, mirror: isFront,
+                               zebra: config.zebra, peaking: config.focusPeaking,
+                               paused: previewsPaused)
+        if state.dualActive {
+            spec.overlay = draggingOverlay ?? config.overlay
+            spec.frontRotation = frontRotation
+            spec.frontMirror = config.mirrorFront
+        }
+        engine.setPreviewSpec(spec)
     }
 
     /// Upright size of each output for the tile captions.
@@ -379,6 +384,7 @@ final class CameraModel: ObservableObject {
         let take = PendingTake(outputs: config.outputs, resolutions: resolutions, codec: config.codec,
                                quality: config.quality, fps: state.fps, dynamicRange: state.dynamicRange,
                                rotationDegrees: rotation, mirror: isFront && config.mirrorFront,
+                               bakeRotation: state.dualActive,
                                folder: TakeStore.root.appendingPathComponent(name), baseName: name)
         engine.startRecording(take)
         isRecording = true
@@ -581,8 +587,51 @@ final class CameraModel: ObservableObject {
         return nearest == button
     }
 
+    // MARK: Front + back
+
+    /// Overlay position while a drag is in progress (committed to the config when it ends).
+    private var draggingOverlay: OverlaySpec?
+
+    /// The selfie frames arrive upright for an upright phone; turn them like the back camera.
+    private var frontRotation: Double { captureRotation - 90 }
+
+    func toggleFrontOverlay() {
+        guard !isRecording, !isSwitching else { return }
+        var next = config
+        next.frontOverlay.toggle()
+        if next.frontOverlay {
+            next.mode = .video
+            if next.lens == .front || next.lens == .auto { next.lens = .wide }
+        }
+        config = next
+        UISelectionFeedbackGenerator().selectionChanged()
+    }
+
+    /// Is `point` (0...1 in the upright tile of `kind`) on the selfie window?
+    func overlayContains(_ point: CGPoint, in kind: OutputKind) -> Bool {
+        guard state.dualActive else { return false }
+        let canvas = CGSize(width: CGFloat(kind.uprightAspect) * 1000, height: 1000)
+        let frontAspect: CGFloat = CropMath.normalizedRotation(frontRotation) % 180 == 0 ? 3.0 / 4.0 : 4.0 / 3.0
+        let rect = OverlayCompositor.windowRect(spec: config.overlay, canvas: canvas, frontAspect: frontAspect)
+        // A little slack around the window makes it easy to grab.
+        return rect.insetBy(dx: -40, dy: -40).contains(CGPoint(x: point.x * canvas.width, y: point.y * canvas.height))
+    }
+
+    /// Drag the selfie window; `point` is 0...1 in the upright tile. `done` saves the position.
+    func moveOverlay(to point: CGPoint, done: Bool) {
+        var spec = config.overlay
+        spec.center = CGPoint(x: min(max(point.x, 0), 1), y: min(max(point.y, 0), 1))
+        if done {
+            draggingOverlay = nil
+            config.overlay = spec
+        } else {
+            draggingOverlay = spec
+            updatePreviewSpec()
+        }
+    }
+
     func flipCamera() {
-        guard !isRecording, !isSwitching, stackProgress == nil else { return }
+        guard !isRecording, !isSwitching, stackProgress == nil, !state.dualActive else { return }
         UISelectionFeedbackGenerator().selectionChanged()
         config.lens = isFront ? .wide : .front
     }

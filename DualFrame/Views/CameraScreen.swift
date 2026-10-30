@@ -245,7 +245,7 @@ struct CameraScreen: View {
     }
 
     private func toolsCapsule(axis: Axis) -> some View {
-        let layout = axis == .horizontal ? AnyLayout(HStackLayout(spacing: 16)) : AnyLayout(VStackLayout(spacing: 4))
+        let layout = axis == .horizontal ? AnyLayout(HStackLayout(spacing: 11)) : AnyLayout(VStackLayout(spacing: 2))
         return layout {
             if model.hasTorch {
                 toolbarIcon(model.torchOn ? "bolt.fill" : "bolt.slash", active: model.torchOn,
@@ -255,6 +255,10 @@ struct CameraScreen: View {
                 model.config.timerSeconds = model.config.timerSeconds == 0 ? 3 : (model.config.timerSeconds == 3 ? 10 : 0)
             }
             .disabled(model.isRecording)
+            toolbarIcon("person.crop.square", active: model.config.frontOverlay, label: "Frente e trás") {
+                model.toggleFrontOverlay()
+            }
+            .disabled(model.isRecording || model.isSwitching)
             toolbarIcon("camera.aperture", active: showPro, label: "Controles manuais") {
                 showPro.toggle()
                 if !showPro { proControl = nil }
@@ -266,7 +270,7 @@ struct CameraScreen: View {
             toolbarIcon("gearshape.fill", active: false, label: "Ajustes") { showSettings = true }
                 .disabled(model.isRecording)
         }
-        .padding(axis == .horizontal ? .horizontal : .vertical, axis == .horizontal ? 16 : 10)
+        .padding(axis == .horizontal ? .horizontal : .vertical, axis == .horizontal ? 12 : 8)
         .frame(width: axis == .vertical ? 44 : nil, height: axis == .horizontal ? 44 : nil)
         .background(.black.opacity(0.55), in: Capsule())
     }
@@ -381,7 +385,7 @@ struct CameraScreen: View {
             Image(systemName: name)
                 .font(.system(size: 18, weight: .medium))
                 .foregroundStyle(active ? Color.accentTeal : Color.white)
-                .frame(width: 28, height: 40)
+                .frame(width: 26, height: 40)
         }
         .accessibilityLabel(label)
     }
@@ -624,6 +628,28 @@ struct FormatPanel: View {
                     ForEach([24, 25, 30, 60], id: \.self) { fps in
                         option("\(fps)", selected: model.config.fps == fps) { model.config.fps = fps }
                     }
+                }
+                row("SELFIE") {
+                    option("Off", selected: !model.config.frontOverlay) {
+                        if model.config.frontOverlay { model.toggleFrontOverlay() }
+                    }
+                    ForEach(OverlaySize.allCases) { size in
+                        option(size.label, selected: model.config.frontOverlay && model.config.overlay.size == size) {
+                            model.config.overlay.size = size
+                            if !model.config.frontOverlay { model.toggleFrontOverlay() }
+                        }
+                    }
+                }
+                if model.config.frontOverlay {
+                    row("JANELA") {
+                        ForEach(OverlayShape.allCases) { shape in
+                            option(shape.label, selected: model.config.overlay.shape == shape) {
+                                model.config.overlay.shape = shape
+                            }
+                        }
+                    }
+                    Text("Frente + trás: a selfie é gravada dentro do mesmo arquivo. Arraste a janela na prévia para posicionar. Limite: 30 fps, SDR.")
+                        .font(.system(size: 11)).foregroundStyle(.white.opacity(0.55))
                 }
                 row("PRIORIDADE") {
                     option("Nitidez", selected: !model.config.preferStabilization) {
