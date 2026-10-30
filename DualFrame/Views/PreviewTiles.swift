@@ -17,6 +17,8 @@ struct SampleBufferView: UIViewRepresentable {
         let view = DisplayView()
         view.displayLayer.videoGravity = .resizeAspectFill
         engine.addPreviewSink(view.displayLayer, for: kind)
+        let engine = self.engine
+        view.onLayout = { layer, pixels in engine.setPreviewSinkSize(layer, pixels: pixels) }
         return view
     }
 
@@ -40,6 +42,13 @@ struct SampleBufferView: UIViewRepresentable {
     final class DisplayView: UIView {
         override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
         var displayLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
+        var onLayout: ((AVSampleBufferDisplayLayer, CGSize) -> Void)?
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            let scale = window?.screen.scale ?? 3
+            onLayout?(displayLayer, CGSize(width: bounds.width * scale, height: bounds.height * scale))
+        }
     }
 }
 

@@ -129,6 +129,9 @@ final class CameraModel: ObservableObject {
         engine.onStackProgress = { [weak self] progress in
             Task { @MainActor in self?.stackProgress = progress }
         }
+        engine.onThermalLoad = { [weak self] load in
+            Task { @MainActor in self?.thermalLoadChanged(load) }
+        }
         engine.onError = { [weak self] message in
             Task { @MainActor in self?.toast = message }
         }
@@ -138,6 +141,14 @@ final class CameraModel: ObservableObject {
             Task { @MainActor in self?.updateThermal() }
         }
         updateThermal()
+    }
+
+    private func thermalLoadChanged(_ load: ThermalLoad) {
+        switch load {
+        case .normal: updateThermal()
+        case .high: thermalWarning = "Câmera aquecendo: prévia e efeitos reduzidos para esfriar."
+        case .critical: thermalWarning = "Câmera muito quente: quadros por segundo reduzidos."
+        }
     }
 
     private func updateThermal() {
@@ -222,7 +233,7 @@ final class CameraModel: ObservableObject {
         }
         // Watchdog: if no frame arrives, restart the session instead of leaving a black screen.
         Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
             guard let self, self.isSwitching, generation == self.reconfigureGeneration else { return }
             self.engine.sessionQueue.async { [engine = self.engine] in engine.restart() }
         }

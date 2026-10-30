@@ -10,15 +10,18 @@ final class LevelMotion: ObservableObject {
 
     func start() {
         guard manager.isDeviceMotionAvailable, !manager.isDeviceMotionActive else { return }
-        manager.deviceMotionUpdateInterval = 1.0 / 30
+        manager.deviceMotionUpdateInterval = 1.0 / 20
         manager.startDeviceMotionUpdates(to: .main) { [weak self] motion, _ in
             guard let g = motion?.gravity else { return }
             let roll = atan2(g.x, -g.y) * 180 / .pi
             let nearest = (roll / 90).rounded() * 90
             let pitch = asin(max(-1, min(1, -g.z))) * 180 / .pi
+            // Publish only visible changes (0.1°): every publish redraws the overlay.
+            let deviation = ((roll - nearest) * 10).rounded() / 10
+            let roundedPitch = pitch.rounded()
             MainActor.assumeIsolated {
-                self?.deviation = roll - nearest
-                self?.pitch = pitch
+                if self?.deviation != deviation { self?.deviation = deviation }
+                if self?.pitch != roundedPitch { self?.pitch = roundedPitch }
             }
         }
     }

@@ -281,7 +281,7 @@ struct CaptureConfig: Codable, Equatable {
 
     /// Fields that require rebuilding the capture session when changed.
     var sessionKey: String {
-        "\(mode.rawValue)|\(lens.rawValue)|\(requiredFormatWidth)|\(preferStabilization)|\(fps)|\(dynamicRange.rawValue)|\(rawPhoto)|\(stabilization.rawValue)|\(formatOverride ?? "-")"
+        "\(mode.rawValue)|\(lens.rawValue)|\(requiredFormatWidth)|\(preferStabilization)|\(fps)|\(dynamicRange.rawValue)|\(stabilization.rawValue)|\(formatOverride ?? "-")"
     }
 
     static let storageKey = "captureConfig.v5"

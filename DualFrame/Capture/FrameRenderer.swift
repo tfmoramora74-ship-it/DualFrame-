@@ -7,6 +7,9 @@ import Metal
 /// One shared CIContext, used from the capture output queue and the photo queue.
 final class FrameRenderer: @unchecked Sendable {
     let context: CIContext
+    /// Previews: 8-bit working format (half the memory traffic of half-float) and low GPU priority,
+    /// so on-screen frames never compete with the recorded files or the UI.
+    let previewContext: CIContext
     private var pools: [String: CVPixelBufferPool] = [:]
     private let poolLock = NSLock()
 
@@ -16,10 +19,14 @@ final class FrameRenderer: @unchecked Sendable {
 
     init() {
         let options: [CIContextOption: Any] = [.cacheIntermediates: false, .workingFormat: CIFormat.RGBAh]
+        let previewOptions: [CIContextOption: Any] = [.cacheIntermediates: false, .workingFormat: CIFormat.RGBA8,
+                                                      .priorityRequestLow: true]
         if let device = MTLCreateSystemDefaultDevice() {
             context = CIContext(mtlDevice: device, options: options)
+            previewContext = CIContext(mtlDevice: device, options: previewOptions)
         } else {
             context = CIContext(options: options)
+            previewContext = CIContext(options: previewOptions)
         }
     }
 
@@ -76,7 +83,7 @@ final class FrameRenderer: @unchecked Sendable {
     /// clean-aperture / pixel-aspect metadata that would distort playback.
     /// A nil `colorSpace` writes the values unconverted (pair with `colorManaged: false` sources).
     func render(_ image: CIImage, size: CGSize, format: OSType, colorSpace: CGColorSpace?,
-                tagsFrom source: CVPixelBuffer?) -> CVPixelBuffer? {
+                tagsFrom source: CVPixelBuffer?, preview: Bool = false) -> CVPixelBuffer? {
         guard let pool = pool(width: Int(size.width), height: Int(size.height), format: format) else { return nil }
         var output: CVPixelBuffer?
         guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &output) == kCVReturnSuccess,
@@ -86,8 +93,17 @@ final class FrameRenderer: @unchecked Sendable {
             CVBufferRemoveAttachment(destination, kCVImageBufferCleanApertureKey)
             CVBufferRemoveAttachment(destination, kCVImageBufferPixelAspectRatioKey)
         }
-        context.render(image, to: destination, bounds: CGRect(origin: .zero, size: size), colorSpace: colorSpace)
+        (preview ? previewContext : context)
+            .render(image, to: destination, bounds: CGRect(origin: .zero, size: size), colorSpace: colorSpace)
         return destination
+    }
+
+    /// A blank pooled buffer (for the hardware scaler to fill).
+    func emptyBuffer(size: CGSize, format: OSType) -> CVPixelBuffer? {
+        guard let pool = pool(width: Int(size.width), height: Int(size.height), format: format) else { return nil }
+        var output: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &output)
+        return output
     }
 
     func writeHEIC(_ image: CIImage, to url: URL) throws {

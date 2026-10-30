@@ -2,6 +2,7 @@ import AVFoundation
 import CoreImage
 import CoreMedia
 import Photos
+import VideoToolbox
 
 /// A sensor format the user can pick by hand.
 struct FormatInfo: Identifiable, Hashable {
@@ -47,7 +48,14 @@ struct PreviewSpec {
 
 private final class WeakLayer {
     weak var layer: AVSampleBufferDisplayLayer?
+    /// On-screen size in pixels; previews are rendered no bigger than this.
+    var pixelSize = CGSize(width: 1080, height: 1920)
     init(_ layer: AVSampleBufferDisplayLayer) { self.layer = layer }
+}
+
+/// Camera heat as AVFoundation reports it (`systemPressureState`), mapped to how much to shed.
+enum ThermalLoad: Int {
+    case normal, high, critical
 }
 
 /// Owns the AVCaptureSession and the capture pipeline. Not main-actor bound:
@@ -83,6 +91,11 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
     private var audioCount = 0
     private var lastBufferSize = CGSize.zero
     var wantsHistogram = false
+    /// Hardware scaler that shrinks each sensor frame once for all previews.
+    private var previewScaler: VTPixelTransferSession?
+    private var pressureObservation: NSKeyValueObservation?
+    private(set) var thermalLoad: ThermalLoad = .normal
+    var onThermalLoad: (@Sendable (ThermalLoad) -> Void)?
 
     // Photo-queue state.
     private var photoJobs: [Int64: PhotoJob] = [:]
@@ -130,6 +143,16 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Called from the view's layout: lets small windows get small (cheap) previews.
+    func setPreviewSinkSize(_ layer: AVSampleBufferDisplayLayer, pixels: CGSize) {
+        guard pixels.width > 1, pixels.height > 1 else { return }
+        lock.lock()
+        for list in previewSinks.values {
+            for sink in list where sink.layer === layer { sink.pixelSize = pixels }
+        }
+        lock.unlock()
+    }
+
     func setPreviewSpec(_ spec: PreviewSpec) {
         lock.lock()
         previewSpec = spec
@@ -138,33 +161,108 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
 
     private func pushPreviews(_ pixelBuffer: CVPixelBuffer, time: CMTime) {
         lock.lock()
-        let sinks = previewSinks.mapValues { $0.compactMap(\.layer) }.filter { !$0.value.isEmpty }
+        let sinks = previewSinks.mapValues { $0.filter { $0.layer != nil } }.filter { !$0.value.isEmpty }
         let spec = previewSpec
         lock.unlock()
         guard !sinks.isEmpty, !spec.paused else { return }
 
-        let width = CVPixelBufferGetWidth(pixelBuffer), height = CVPixelBufferGetHeight(pixelBuffer)
+        // Previews never need more than 30 fps; when the phone is hot, drop to 15 or 10.
+        let fps = device.map { 1 / max($0.activeVideoMinFrameDuration.seconds, 0.001) } ?? 30
+        var every = max(1, Int((fps / 30).rounded()))
+        if thermalLoad == .high { every *= 2 }
+        if thermalLoad == .critical { every *= 3 }
+        guard frameCount % every == 0 else { return }
+
         let rotation = CropMath.normalizedRotation(spec.rotationDegrees)
         let verticalIsBufferX = rotation == 90 || rotation == 270
-        let source = FrameRenderer.source(pixelBuffer, colorManaged: true)
-        for (kind, layers) in sinks {
+
+        // One hardware downscale per frame (dedicated scaler, nearly free) instead of
+        // filtering the full 12 MP frame on the GPU for every preview.
+        let largestWanted = sinks.values.flatMap { $0 }.map { max($0.pixelSize.width, $0.pixelSize.height) }.max() ?? 1920
+        let base = previewBase(pixelBuffer, longestNeeded: min(largestWanted, thermalLoad == .normal ? 1920 : 1280))
+        let width = CVPixelBufferGetWidth(base), height = CVPixelBufferGetHeight(base)
+        let source = FrameRenderer.source(base, colorManaged: true)
+        let effects = thermalLoad == .normal
+
+        for (kind, entries) in sinks {
             let crop = CropMath.region(kind: kind, width: width, height: height, verticalIsBufferX: verticalIsBufferX)
             let upright = CropMath.uprightSize(crop.size, rotationDegrees: Double(rotation))
-            // Full-screen previews need close to screen resolution or they look blocky.
-            let scale = min(1, 1920 / max(upright.width, upright.height))
+            // Big enough to cover the largest view showing this format (aspect fill), never upscaled.
+            let cover = entries.map { max($0.pixelSize.width / upright.width, $0.pixelSize.height / upright.height) }.max() ?? 1
+            let scale = min(1, cover)
             let size = CGSize(width: CropMath.even(upright.width * scale), height: CropMath.even(upright.height * scale))
             var image = renderer.image(from: source, crop: crop, rotation: rotation, mirror: spec.mirror, size: size)
-            if spec.peaking { image = Self.peaking(image) }
-            if spec.zebra { image = Self.zebra(image) }
+            if effects, spec.peaking { image = Self.peaking(image) }
+            if effects, spec.zebra { image = Self.zebra(image) }
             guard let frame = renderer.render(image, size: size, format: kCVPixelFormatType_32BGRA,
-                                              colorSpace: FrameRenderer.displaySpace, tagsFrom: nil),
+                                              colorSpace: FrameRenderer.displaySpace, tagsFrom: nil, preview: true),
                   let sample = Self.displaySample(frame, time: time) else { continue }
-            for layer in layers {
+            for entry in entries {
+                guard let layer = entry.layer else { continue }
                 let sink = layer.sampleBufferRenderer
                 if sink.status == .failed || sink.requiresFlushToResumeDecoding { sink.flush() }
                 sink.enqueue(sample)
             }
         }
+    }
+
+    /// The sensor frame shrunk by the hardware scaler to roughly what the previews need
+    /// (half or quarter size), or the frame itself when it is already small.
+    private func previewBase(_ pixelBuffer: CVPixelBuffer, longestNeeded: CGFloat) -> CVPixelBuffer {
+        let width = CVPixelBufferGetWidth(pixelBuffer), height = CVPixelBufferGetHeight(pixelBuffer)
+        let longest = CGFloat(max(width, height))
+        var factor = 1
+        while longest / CGFloat(factor * 2) >= longestNeeded { factor *= 2 }
+        guard factor > 1 else { return pixelBuffer }
+        if previewScaler == nil {
+            var session: VTPixelTransferSession?
+            VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &session)
+            previewScaler = session
+        }
+        let size = CGSize(width: CropMath.even(Double(width / factor)), height: CropMath.even(Double(height / factor)))
+        guard let scaler = previewScaler,
+              let small = renderer.emptyBuffer(size: size, format: CVPixelBufferGetPixelFormatType(pixelBuffer)) else {
+            return pixelBuffer
+        }
+        CVBufferPropagateAttachments(pixelBuffer, small)
+        CVBufferRemoveAttachment(small, kCVImageBufferCleanApertureKey)
+        return VTPixelTransferSessionTransferImage(scaler, from: pixelBuffer, to: small) == noErr ? small : pixelBuffer
+    }
+
+    // MARK: Heat
+
+    /// Watches the camera's own heat/power report and sheds work before iOS has to throttle us.
+    private func observePressure(of device: AVCaptureDevice) {
+        pressureObservation = device.observe(\.systemPressureState, options: [.initial, .new]) { [weak self] device, _ in
+            let level = device.systemPressureState.level
+            let load: ThermalLoad
+            switch level {
+            case .serious: load = .high
+            case .critical, .shutdown: load = .critical
+            default: load = .normal
+            }
+            guard let self else { return }
+            self.outputQueue.async {
+                guard self.thermalLoad != load else { return }
+                self.thermalLoad = load
+                self.onThermalLoad?(load)
+            }
+            // Apple's advice: lower the frame rate under pressure (only when not recording).
+            if load == .critical {
+                self.sessionQueue.async { self.capFrameRate(24) }
+            }
+        }
+    }
+
+    private func capFrameRate(_ fps: Double) {
+        guard let device, writer == nil, (try? device.lockForConfiguration()) != nil else { return }
+        let current = 1 / max(device.activeVideoMinFrameDuration.seconds, 0.001)
+        if current > fps {
+            let duration = CMTime(value: 1000, timescale: CMTimeScale(fps * 1000))
+            device.activeVideoMinFrameDuration = duration
+            if device.activeVideoMaxFrameDuration < duration { device.activeVideoMaxFrameDuration = duration }
+        }
+        device.unlockForConfiguration()
     }
 
     /// Diagonal stripes where the picture is about to clip (≈ 95 % luma).
@@ -247,6 +345,7 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
         }
         self.device = device
         state.device = device
+        observePressure(of: device)
 
         if audioInput == nil, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
            let mic = AVCaptureDevice.default(for: .audio),
@@ -263,6 +362,8 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
             if session.canAddOutput(audioOutput) { session.addOutput(audioOutput) }
             outputsAdded = true
         }
+        // Microphone samples are only needed while filming.
+        audioOutput.connection(with: .audio)?.isEnabled = config.mode == .video
         // The photo output only lives in photo mode: it limits formats and costs bandwidth otherwise.
         if config.mode == .photo, !photoOutputAdded, session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
@@ -366,8 +467,10 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
             if let largest = device.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
                 photoOutput.maxPhotoDimensions = largest
             }
-            photoOutput.maxPhotoQualityPrioritization = .quality
-            photoOutput.isAppleProRAWEnabled = photoOutput.isAppleProRAWSupported && config.rawPhoto
+            // .balanced keeps Deep Fusion / Smart HDR but not the always-on zero-lag buffers of .quality.
+            photoOutput.maxPhotoQualityPrioritization = .balanced
+            // Bayer DNG needs no special pipeline, so RAW on/off costs nothing until a photo is taken.
+            if photoOutput.isAppleProRAWEnabled { photoOutput.isAppleProRAWEnabled = false }
             state.rawAvailable = !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty
             if config.rawPhoto && !state.rawAvailable {
                 state.notes.append("Esta lente/formato não oferece RAW.")
@@ -466,9 +569,7 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
             }
             let settings: AVCapturePhotoSettings
             let rawTypes = self.photoOutput.availableRawPhotoPixelFormatTypes
-            let rawType = self.photoOutput.isAppleProRAWEnabled
-                ? rawTypes.first(where: AVCapturePhotoOutput.isAppleProRAWPixelFormat)
-                : rawTypes.first(where: AVCapturePhotoOutput.isBayerRAWPixelFormat)
+            let rawType = rawTypes.first(where: AVCapturePhotoOutput.isBayerRAWPixelFormat)
             if request.raw, let rawType {
                 let processed: [String: Any]? = self.photoOutput.availablePhotoCodecTypes.contains(.hevc)
                     ? [AVVideoCodecKey: AVVideoCodecType.hevc] : nil
@@ -479,7 +580,7 @@ final class CaptureEngine: NSObject, @unchecked Sendable {
                 settings = AVCapturePhotoSettings()
             }
             settings.maxPhotoDimensions = self.photoOutput.maxPhotoDimensions
-            settings.photoQualityPrioritization = request.raw ? .speed : .quality
+            settings.photoQualityPrioritization = request.raw ? .speed : .balanced
 
             if let connection = self.photoOutput.connection(with: .video) {
                 let front = self.device?.position == .front
