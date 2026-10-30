@@ -48,16 +48,6 @@ struct CameraScreen: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
-                // Recording border for the full-screen layout: drawn on the screen outline (inside the
-                // display's rounded corners) so it shows evenly on all four sides.
-                if model.isRecording, model.config.recordingBorder, model.config.layout == .pip, !fullOnly {
-                    RoundedRectangle(cornerRadius: displayCornerRadius, style: .continuous)
-                        .strokeBorder(Color.red.opacity(0.9), lineWidth: 3)
-                        .ignoresSafeArea()
-                        .allowsHitTesting(false)
-                        .transition(.opacity)
-                }
-
                 Color.white.opacity(flashOpacity).ignoresSafeArea().allowsHitTesting(false)
 
                 if let toast = model.toast {
@@ -79,6 +69,8 @@ struct CameraScreen: View {
                     .allowsHitTesting(false)
                 }
             }
+            // Never wider than the screen: an overflowing row used to push the layout off the right edge.
+            .frame(width: geo.size.width, height: geo.size.height)
         }
         .preferredColorScheme(.dark)
         .tint(.accentTeal)
@@ -117,6 +109,16 @@ struct CameraScreen: View {
             GalleryView(store: store)
         }
         .background(ShutterButtonInteraction { model.shutterPressed() })
+        // Recording border for the full-screen layout, attached to the root so it always matches the
+        // physical screen (inside the display's rounded corners) on all four sides.
+        .overlay {
+            if model.isRecording, model.config.recordingBorder, model.config.layout == .pip, !fullOnly {
+                RoundedRectangle(cornerRadius: displayCornerRadius, style: .continuous)
+                    .strokeBorder(Color.red.opacity(0.9), lineWidth: 3)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+            }
+        }
     }
 
     // MARK: Layouts
@@ -235,7 +237,7 @@ struct CameraScreen: View {
         Button {
             withAnimation(.easeOut(duration: 0.2)) { showFormatPanel.toggle() }
         } label: {
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 switch model.config.mode {
                 case .video:
                     chipValue(primaryResolutionLabel, sub: "RES")
@@ -249,7 +251,7 @@ struct CameraScreen: View {
                     .font(.system(size: 17, weight: .medium))
                     .foregroundStyle(Color.accentTeal)
             }
-            .padding(.horizontal, 16)
+            .padding(.horizontal, 13)
             .frame(height: 44)
             .fixedSize()
             .background(.black.opacity(0.55), in: Capsule())
@@ -259,7 +261,7 @@ struct CameraScreen: View {
     }
 
     private func toolsCapsule(axis: Axis) -> some View {
-        let layout = axis == .horizontal ? AnyLayout(HStackLayout(spacing: 11)) : AnyLayout(VStackLayout(spacing: 2))
+        let layout = axis == .horizontal ? AnyLayout(HStackLayout(spacing: 7)) : AnyLayout(VStackLayout(spacing: 2))
         return layout {
             if model.hasTorch {
                 toolbarIcon(model.torchOn ? "bolt.fill" : "bolt.slash", active: model.torchOn,
@@ -284,7 +286,7 @@ struct CameraScreen: View {
             toolbarIcon("gearshape.fill", active: false, label: "Ajustes") { showSettings = true }
                 .disabled(model.isRecording)
         }
-        .padding(axis == .horizontal ? .horizontal : .vertical, axis == .horizontal ? 12 : 8)
+        .padding(axis == .horizontal ? .horizontal : .vertical, axis == .horizontal ? 10 : 8)
         .frame(width: axis == .vertical ? 44 : nil, height: axis == .horizontal ? 44 : nil)
         .background(.black.opacity(0.55), in: Capsule())
     }

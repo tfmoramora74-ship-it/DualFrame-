@@ -2,6 +2,9 @@
 
 Todas as versões do DualFrame. O IPA mais recente está sempre na release [`latest`](https://github.com/tfmoramora74-ship-it/DualFrame-/releases/tag/latest).
 
+## 1.12
+- Borda de gravação visível também no lado direito: a barra superior foi compactada (ela passava da largura da tela e empurrava o layout) e a borda agora é presa ao tamanho real da tela.
+
 ## 1.11
 - Borda vermelha de gravação igual nos quatro lados na prévia em tela cheia (segue os cantos arredondados da tela).
 - Nova opção em Ajustes: **Borda vermelha ao gravar** (ligar/desligar).
